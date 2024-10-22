@@ -3,18 +3,18 @@
 import numpy as np
 
 class Particle:
-    def __init__(self, charge, mass, position, velocity):
+    def __init__(self, charge, mass, position, momentum):
         self.charge = charge
         self.mass = mass
-        self.position = np.array(position)  # [x, y, z]
-        self.velocity = np.array(velocity)  # [vx, vy, vz]
-        self.positions = [np.array(position)]  # To store the trajectory
-        self.velocities = [np.array(velocity)]
+        self.position = np.array(position)
+        self.momentum = np.array(momentum)
+        self.positions = [self.position.copy()]
+        self.momenta = [self.momentum.copy()]
 
-    def update_position(self, new_position):
-        self.position = new_position
-        self.positions.append(new_position)
+    def update_momentum(self, momentum):
+        self.momentum = momentum
+        self.momenta.append(momentum.copy())
 
-    def update_velocity(self, new_velocity):
-        self.velocity = new_velocity
-        self.velocities.append(new_velocity)
+    def update_position(self, position):
+        self.position = position
+        self.positions.append(position.copy())
