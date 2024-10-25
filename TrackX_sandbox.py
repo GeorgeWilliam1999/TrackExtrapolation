@@ -29,7 +29,7 @@ def RK4_simulate_particles_LHCb():
 
 def RK4_simulate_particles_quad():
     B0 = 1         # Base magnetic field strength (Tesla)
-    dt = 1e-13     # Time step (seconds)
+    dt = 1e-14     # Time step (seconds)
     num_steps = 1000  # Number of steps in the simulation
 
     # Create a magnetic field
