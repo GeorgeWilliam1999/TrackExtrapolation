@@ -74,6 +74,7 @@ class LHCb_Field:
         # Extract x, y, z, bx, by, bz columns
         x, y, z, bx, by, bz = data.T
         # Reshape the data into a grid
+        bx, by, bz = bx / 2000 , by / 2000, bz / 2000
         self.x_grid = np.unique(x)
         self.y_grid = np.unique(y)
         self.z_grid = np.unique(z)
@@ -93,6 +94,7 @@ class LHCb_Field:
 
     def interpolated_field(self, x, y, z):
         """Interpolate the magnetic field vector at (x, y, z) using RegularGridInterpolator."""
+        # print(f'interpolated filed position {x,y,z}')
         point = np.array([x, y, z])
 
                 # Check if the point is within bounds

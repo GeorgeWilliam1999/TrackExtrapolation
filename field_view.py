@@ -63,7 +63,7 @@ magnitude = ax.contourf(X, Y, B_magnitude, cmap='plasma', levels=50)
 plt.colorbar(magnitude, ax=ax, label='Field Strength |B|')
 
 # Initial quiver plot (direction arrows)
-quiver = ax.quiver(X, Y, Bx, By, scale=None, scale_units='xy', color='white', alpha = 0.1)
+quiver = ax.quiver(X, Y, Bx, By, scale=100, scale_units='xy', color='white', alpha = 0)
 
 # Add a slider for selecting the z-coordinate
 ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03], facecolor='lightgoldenrodyellow')
