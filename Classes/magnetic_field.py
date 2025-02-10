@@ -74,7 +74,7 @@ class LHCb_Field:
         # Extract x, y, z, bx, by, bz columns
         x, y, z, bx, by, bz = data.T
         # Reshape the data into a grid
-        bx, by, bz = bx / 2000 , by / 2000, bz / 2000
+        # bx, by, bz = bx / 2000 , by / 2000, bz / 2000
         self.x_grid = np.unique(x)
         self.y_grid = np.unique(y)
         self.z_grid = np.unique(z)
@@ -108,6 +108,22 @@ class LHCb_Field:
         by = self.interpolator_by(point)
         bz = self.interpolator_bz(point)
         return np.array([bx, by, bz]).reshape(3,)
+    
+    def find_gradient(self, x, y, z):
+        """Find the gradient of the magnetic field at (x, y, z) using RegularGridInterpolator."""
+        point = np.array([x, y, z])
+        # Check if the point is within bounds
+        if (point[0] < self.x_grid[0] or point[0] > self.x_grid[-1] or
+            point[1] < self.y_grid[0] or point[1] > self.y_grid[-1] or
+            point[2] < self.z_grid[0] or point[2] > self.z_grid[-1]):
+            return np.array([0.0, 0.0, 0.0]).reshape(3,)
+
+        # Calculate the gradient using finite differences
+        delta = 1e-6
+        bx_dx = (self.interpolator_bx(point + np.array([delta, 0, 0])) - self.interpolator_bx(point - np.array([delta, 0, 0])))/(2*delta)
+        by_dy = (self.interpolator_by(point + np.array([0, delta, 0])) - self.interpolator_by(point - np.array([0, delta, 0])))/(2*delta)
+        bz_dz = (self.interpolator_bz(point + np.array([0, 0, delta])) - self.interpolator_bz(point - np.array([0, 0, delta])))/(2*delta)
+        return np.array([bx_dx, by_dy, bz_dz]).reshape(3,)
 
     def plot_interpolated_field(self, x, y, z_values):
         """Plot the interpolated magnetic field for different values of z."""
@@ -128,3 +144,83 @@ class LHCb_Field:
         plt.legend()
         plt.grid(True)
         plt.show()
+
+if __name__ == "__main__":
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Slider
+
+    # Assuming field data is loaded correctly and processed as per your logic
+    field = np.loadtxt('Data/Bfield.rtf')
+
+    # Normalize x, y, z values
+    for i in [0, 1, 2]:
+        field[:, i] += np.abs(np.min(field[:, i]))
+        field[:, i] /= 10
+
+    # Prepare the 4D Bfield array
+    B = np.zeros((41, 41, 146, 3))  # Assuming dimensions are correct based on field data
+    for r in field:
+        B[int(r[0]), int(r[1]), int(r[2])] = r[3:]
+
+    def plot_field_slice(Bfield, z, quiver_plot, magnitude_plot):
+        """
+        Update the plot for a given z-coordinate with field strength as colour
+        and field direction as arrows.
+        """
+        # Extract Bx, By, Bz for the current z-slice
+        Bx = Bfield[:, :, z, 0]
+        By = Bfield[:, :, z, 1]
+        Bz = Bfield[:, :, z, 2]
+
+        # Update quiver plot
+        quiver_plot.set_UVC(Bx, By)
+
+        # Update magnitude plot
+        B_magnitude = np.sqrt(Bx**2 + By**2 + Bz**2)
+        magnitude_plot.set_array(B_magnitude.ravel())
+        # magnitude_plot.autoscale()  # Rescale to the maximum value in the current slice
+        # magnitude_plot.changed()  # Mark the magnitude plot as changed
+
+        # Update quiver plot
+        quiver_plot.set_UVC(Bx, By)
+
+    def update(val):
+        z = int(slider.val)
+        plot_field_slice(B, z, quiver, magnitude)
+        plt.draw()
+
+    # Create figure and axis for plotting
+    fig, ax = plt.subplots(figsize=(8, 6))
+    plt.subplots_adjust(left=0.1, bottom=0.25)
+
+    # Create a meshgrid for x and y coordinates (assuming uniform spacing)
+    x = np.arange(B.shape[0])
+    y = np.arange(B.shape[1])
+    X, Y = np.meshgrid(x, y)
+
+    # Initial plot for z = 0
+    initial_z = 0
+    Bx = B[:, :, initial_z, 0]
+    By = B[:, :, initial_z, 1]
+    Bz = B[:, :, initial_z, 2]
+
+    # Initial magnitude plot (colour map)
+    B_magnitude = np.sqrt(Bx**2 + By**2 + Bz**2)
+    magnitude = ax.contourf(X, Y, B_magnitude, cmap='plasma', levels=50)
+    plt.colorbar(magnitude, ax=ax, label='Field Strength |B|')
+
+    # Initial quiver plot (direction arrows)
+    quiver = ax.quiver(X, Y, Bx, By, scale=100, scale_units='xy', color='white', alpha = 0)
+
+    # Add a slider for selecting the z-coordinate
+    ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03], facecolor='lightgoldenrodyellow')
+    slider = Slider(ax_slider, 'Z', 0, B.shape[2] - 1, valinit=initial_z, valstep=1)
+
+    # Call update function when the slider is changed
+    slider.on_changed(update)
+
+    # Show the plot with the slider
+    plt.show()
+    ##########
+    # field_view.py
