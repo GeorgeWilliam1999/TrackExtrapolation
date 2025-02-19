@@ -51,11 +51,8 @@ class Quadratic_Field:
         return np.linalg.norm(B)
 
     def interpolated_field(self, x, y, z):
-        """Interpolate the magnetic field vector at (x, y, z) using RegularGridInterpolator."""
-        Bx = self.B0 * -4*z**2 - 4* z  # Parabolic in Z
-        By = self.B0 * -4*z**2 - 4* z  # Parabolic in Z
-        Bz = self.B0 * z               # Linear in z
-        return np.array([Bx, By, Bz])
+
+        return self.magnetic_field(x, y, z)
 
 
 
@@ -84,7 +81,7 @@ class LHCb_Field:
 
     def field_strength(self, B):
         """Calculate the magnitude (absolute value) of the magnetic field vector B"""
-        return np.linalg.norm(B)
+        return np.linalg.norm(B) * 10000000000000
 
     def create_interpolators(self):
         # Create interpolators for each component of the B field

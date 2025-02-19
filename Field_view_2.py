@@ -4,7 +4,7 @@ from matplotlib.widgets import Slider
 from matplotlib.animation import FuncAnimation, PillowWriter
 
 # Assuming field data is loaded correctly and processed as per your logic
-field = np.loadtxt('Data/Bfield.rtf')
+field = np.loadtxt('Data\Bfield_recentred.rtf')
 
 # Normalize x, y, z values
 for i in [0, 1, 2]:

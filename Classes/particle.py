@@ -1,6 +1,8 @@
 # particle.py
 
 import numpy as np
+import json, datetime
+import os
 
 class Particle:
     def __init__(self,Ptype, charge, mass, position, momentum):
@@ -41,3 +43,8 @@ class particle_state:
 
     def get_state_histores(self):
         return self.state_histores
+    
+    def end_run(self,output_dir):
+        filename = os.path.join(output_dir, f"{self.Ptype}.json")
+        with open(filename, "w") as f:
+            json.dump(self.state_histores, f, indent=4)

@@ -3,7 +3,15 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 
 # Assuming field data is loaded correctly and processed as per your logic
-field = np.loadtxt('Bfield.rtf')
+field = np.loadtxt('Data/twodip.rtf')
+
+xmin, xmax = field[:, 0].min(), field[:, 0].max()
+ymin, ymax = field[:, 1].min(), field[:, 1].max()
+zmin, zmax = field[:, 2].min(), field[:, 2].max()
+
+print(f"X domain: {xmin} to {xmax}")
+print(f"Y domain: {ymin} to {ymax}")
+print(f"Z domain: {zmin} to {zmax}")
 
 # Normalize x, y, z values
 for i in [0, 1, 2]:

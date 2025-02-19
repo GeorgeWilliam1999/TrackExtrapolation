@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from Classes.magnetic_field import MagneticField, Quadratic_Field, LHCb_Field
 from matplotlib.widgets import CheckButtons
+import os 
+import datetime
 
 class RK4_sim_dt:
     def __init__(self, particles, field: MagneticField, dt, num_steps):
@@ -42,7 +44,7 @@ class RK4_sim_dt:
             particle.update_momentum(p_next)
             particle.update_position(r_next)
 
-            print(f'{particle.Ptype}|  position : {r} velocity in units of c : {np.linalg.norm(p / m)}, B field strength : {self.field.field_strength(self.field.interpolated_field(r[0], r[1], r[2]))}, Lorentz Force : {self.lorentz_force(particle, p, r)}')  # Print the position and velocity
+            # print(f'{particle.Ptype}|  position : {r} velocity in units of c : {np.linalg.norm(p / m)}, B field strength : {self.field.field_strength(self.field.interpolated_field(r[0], r[1], r[2]))}, Lorentz Force : {self.lorentz_force(particle, p, r)}')  # Print the position and velocity
 
     def run(self):
         """Run the simulation for the specified number of steps"""
@@ -128,6 +130,8 @@ class RK4_sim_dz():
         self.dz = dz
         self.z = z
         self.num_steps = num_steps
+        self.output_dir = "Recorded_trajectories/run_" + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        os.makedirs(self.output_dir, exist_ok=True)
 
     def compute_state_derivative(self, state, B):
         """Compute the derivative of the state vector using the Lorentz force"""
@@ -151,35 +155,37 @@ class RK4_sim_dz():
             state = particle.get_state()
             print(f'state : {state}')
             # Compute k1
-            k1 = self.compute_state_derivative(state,self.field.interpolated_field(state['x'], state['y'], z))
+            k1 = self.compute_state_derivative(state,self.field.interpolated_field(state['x'], state['y'], state['z']))
 
             # Compute k2
             state_k2 = {key: state[key] + 0.5 * self.dz * k1[key] for key in state}
-            k2 = self.compute_state_derivative(state_k2,self.field.interpolated_field(state['x'], state['y'], z + 0.5 * self.dz))
+            k2 = self.compute_state_derivative(state_k2,self.field.interpolated_field(state['x'], state['y'], state['z'] + 0.5 * self.dz))
 
             # Compute k3
             state_k3 = {key: state[key] + 0.5 * self.dz * k2[key] for key in state}
-            k3 = self.compute_state_derivative(state_k3, self.field.interpolated_field(state['x'], state['y'],z + 0.5 * self.dz))
+            k3 = self.compute_state_derivative(state_k3, self.field.interpolated_field(state['x'], state['y'],state['z'] + 0.5 * self.dz))
 
             # Compute k4
             state_k4 = {key: state[key] + self.dz * k3[key] for key in state}
-            k4 = self.compute_state_derivative(state_k4, self.field.interpolated_field(state['x'], state['y'],z + self.dz))
+            k4 = self.compute_state_derivative(state_k4, self.field.interpolated_field(state['x'], state['y'],state['z'] + self.dz))
 
             # Update state
             for key in state:
                 state[key] += (self.dz / 6.0) * (k1[key] + 2 * k2[key] + 2 * k3[key] + k4[key])
-            state['z'] = self.z
+            state['z'] = self.z + self.dz
             particle.update_state(state)
             particle.record_state()
-            print(particle.get_state())
+            # print(particle.get_state())
 
 
     def run(self):
         """Run the simulation for the specified number of steps"""
-
+        i = 0
         for _ in range(self.num_steps):
             self.rk4_step(self.z)
             self.z += self.dz
+        for particle in self.particles:
+            particle.end_run(self.output_dir)
 
 
     def plot_trajectory_with_lorentz_force(self):
@@ -213,9 +219,9 @@ class RK4_sim_dz():
             #           [state['ty'] for state in states[::n]], angles='xy', scale_units='xy', scale=1, color='green')
 
         # Set labels and show plot
-        ax.set_xlabel('Z position (m)')
-        ax.set_ylabel('Y position (m)')
-        ax.set_zlabel('X position (m)')
+        ax.set_xlabel('Z position (cm)')
+        ax.set_ylabel('Y position (cm)')
+        ax.set_zlabel('X position (cm)')
         ax.set_title('dz Sim')
         ax.legend()
 
@@ -233,5 +239,55 @@ class RK4_sim_dz():
         # plt.show()
 
 
+class dz_propagator():
 
+    def __init__(self, particle_state, field: MagneticField, dz, z):
+        self.particle = particle_state  # List of particles, using the particle_state object
+        self.field = field
+        self.dz = dz
+        self.z = z
+
+    def compute_state_derivative(self, state, B):
+        """Compute the derivative of the state vector using the Lorentz force"""
+
+        # print(f' B field vector values: {B} | B field strength : {self.field.field_strength(B)}')
+
+        x = state['x']
+        y = state['y']
+        tx = state['tx']
+        ty = state['ty']
+        q_over_p = state['q/p']
+        dx = tx
+        dy = ty
+        dtx = q_over_p * np.sqrt(1 + tx**2 + ty**2) * (ty*(tx*B[0] + B[2]) - (1 + tx**2)*B[1])
+        dty = -q_over_p * np.sqrt(1 + tx**2 + ty**2) * (tx*(ty*B[1] + B[2]) - (1 + ty**2)*B[0])
+        return {'x': dx, 'y': dy, 'z' : 0, 'tx': dtx, 'ty': dty, 'q/p': 0}
+
+    def rk4_step(self,z):
+        """Perform a single RK4 step to update the particles' positions and momenta"""
+        state = self.particle.get_state()
+        print(f'state : {state}')
+        # Compute k1
+        k1 = self.compute_state_derivative(state,self.field.interpolated_field(state['x'], state['y'], state['z']))
+
+        # Compute k2
+        state_k2 = {key: state[key] + 0.5 * self.dz * k1[key] for key in state}
+        k2 = self.compute_state_derivative(state_k2,self.field.interpolated_field(state['x'], state['y'], state['z'] + 0.5 * self.dz))
+
+        # Compute k3
+        state_k3 = {key: state[key] + 0.5 * self.dz * k2[key] for key in state}
+        k3 = self.compute_state_derivative(state_k3, self.field.interpolated_field(state['x'], state['y'],state['z'] + 0.5 * self.dz))
+
+        # Compute k4
+        state_k4 = {key: state[key] + self.dz * k3[key] for key in state}
+        k4 = self.compute_state_derivative(state_k4, self.field.interpolated_field(state['x'], state['y'],state['z'] + self.dz))
+
+        # Update state
+        for key in state:
+            state[key] += (self.dz / 6.0) * (k1[key] + 2 * k2[key] + 2 * k3[key] + k4[key])
+        state['z'] = self.z + self.dz
+
+
+        return k1,k2,k3,k4
+        
 
