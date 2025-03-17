@@ -5,34 +5,25 @@ import os
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import itertools
-import plotly.io as pio
+import webbrowser
+import plotly.io as p
+from math import ceil
+from collections import defaultdict
 
 class RK_PINN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(RK_PINN, self).__init__()
-        
-        # Create ModuleList to hold hidden layers
         self.hidden_layers = nn.ModuleList()
-        
-        # First hidden layer (from input_dim to hidden_dim)
         self.hidden_layers.append(nn.Linear(input_dim, hidden_dim))
-        
-        # Additional hidden layers (from hidden_dim to hidden_dim)
         for _ in range(num_layers - 1):
             self.hidden_layers.append(nn.Linear(hidden_dim, hidden_dim))
-            
-        # Output layer
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.activation = nn.Tanh()
 
     def forward(self, x):
-        # Pass through hidden layers
         for layer in self.hidden_layers:
             x = self.activation(layer(x))
-        
-        # Output layer (no activation)
-        x = self.output_layer(x)
-        return x
+        return self.output_layer(x)
 
 def van_der_pol(t, y, mu=1.0):
     dydt = torch.zeros_like(y)
@@ -42,13 +33,8 @@ def van_der_pol(t, y, mu=1.0):
 
 def implicit_midpoint_step(model, y0, t0, dt):
     y_mid = y0 + 0.5 * dt * van_der_pol(t0, y0)
-    
-    def func(y_mid):
-        return y_mid - y0 - 0.5 * dt * (van_der_pol(t0, y0) + van_der_pol(t0 + 0.5 * dt, y_mid))
-    
     for _ in range(10):
         y_mid = y0 + 0.5 * dt * (van_der_pol(t0, y0) + van_der_pol(t0 + 0.5 * dt, y_mid))
-    
     y_next = y0 + dt * van_der_pol(t0 + 0.5 * dt, y_mid)
     return y_next
 
@@ -62,23 +48,11 @@ def train(model, optimizer, criterion, y0, t0, dt, epochs):
         loss.backward()
         optimizer.step()
         losses.append(loss.item())
-        if epoch % 100 == 0:
+        if epoch % 10 == 0:
             print(f'Epoch {epoch}, Loss: {loss.item()}')
     return losses
 
-if __name__ == "__main__":
-    # Define parameter ranges
-    parameter_ranges = {
-        'input_dim': [2],
-        'hidden_dim': [i for i in range(1, 101, 10)],
-        'output_dim': [2],
-        'num_layers': [i for i in range(1, 11)],
-        'learning_rate': [i * 1e-3 for i in range(1, 11)],
-        'epochs': [1000],
-        'dt': [i * 1e-2 for i in range(1, 11)]
-    }
-
-    # Generate all combinations of parameters
+def generate_parameter_combinations(parameter_ranges):
     param_combinations = list(itertools.product(
         parameter_ranges['input_dim'],
         parameter_ranges['hidden_dim'],
@@ -88,8 +62,6 @@ if __name__ == "__main__":
         parameter_ranges['epochs'],
         parameter_ranges['dt']
     ))
-
-    # Convert to list of dictionaries
     all_params = []
     for combo in param_combinations:
         param_dict = {
@@ -102,141 +74,202 @@ if __name__ == "__main__":
             'dt': combo[6]
         }
         all_params.append(param_dict)
+    return all_params
 
+def create_dashboard(results, save_path):
+    fig_params = make_subplots(rows=2, cols=2, subplot_titles=("HD vs Final Loss", "Layers vs Final Loss",
+                                                               "LR vs Final Loss", "dt vs Final Loss"))
+    hidden_dim_data = defaultdict(list)
+    num_layers_data = defaultdict(list)
+    learning_rate_data = defaultdict(list)
+    dt_data = defaultdict(list)
+
+    for param_str, loss_lists in results.items():
+        if not loss_lists:
+            continue
+        loss_history = loss_lists[0]
+        final_loss = loss_history[-1]
+        param_dict = eval(param_str)
+
+        hd = param_dict['hidden_dim']
+        hidden_dim_data[hd].append(final_loss)
+
+        nl = param_dict['num_layers']
+        num_layers_data[nl].append(final_loss)
+
+        lr = param_dict['learning_rate']
+        learning_rate_data[lr].append(final_loss)
+
+        d_t = param_dict['dt']
+        dt_data[d_t].append(final_loss)
+
+    def average_dict(data_dict):
+        return {k: sum(v)/len(v) for k, v in data_dict.items()}
+
+    hd_avg = average_dict(hidden_dim_data)
+    nl_avg = average_dict(num_layers_data)
+    lr_avg = average_dict(learning_rate_data)
+    dt_avg = average_dict(dt_data)
+
+    fig_params.add_trace(go.Scatter(x=list(hd_avg.keys()), y=list(hd_avg.values()),
+                                    mode='lines+markers', name='HD'),
+                         row=1, col=1)
+    fig_params.add_trace(go.Scatter(x=list(nl_avg.keys()), y=list(nl_avg.values()),
+                                    mode='lines+markers', name='Layers'),
+                         row=1, col=2)
+    fig_params.add_trace(go.Scatter(x=list(lr_avg.keys()), y=list(lr_avg.values()),
+                                    mode='lines+markers', name='LR'),
+                         row=2, col=1)
+    fig_params.add_trace(go.Scatter(x=list(dt_avg.keys()), y=list(dt_avg.values()),
+                                    mode='lines+markers', name='dt'),
+                         row=2, col=2)
+
+    labels = ["HD","Layers","LR","dt"]
+    idx = 0
+    for i in range(1, 3):
+        for j in range(1, 3):
+            fig_params.update_xaxes(title_text=labels[idx], row=i, col=j)
+            fig_params.update_yaxes(title_text="Final Loss", row=i, col=j)
+            idx += 1
+    fig_params.update_layout(title="Hyperparameter Effects on Final Loss")
+
+    fig_convergence = make_subplots(rows=1, cols=1, subplot_titles=["Loss Convergence"])
+    for param_str, loss_lists in results.items():
+        if not loss_lists:
+            continue
+        param_dict = eval(param_str)
+        label = f"HD={param_dict['hidden_dim']}, NL={param_dict['num_layers']}, LR={param_dict['learning_rate']}, dt={param_dict['dt']}"
+        fig_convergence.add_trace(
+            go.Scatter(x=list(range(len(loss_lists[0]))), y=loss_lists[0], mode='lines', name=label),
+            row=1, col=1
+        )
+    fig_convergence.update_xaxes(title_text="Epochs")
+    fig_convergence.update_yaxes(title_text="Loss")
+    fig_convergence.update_layout(title="Loss Convergence for Different Hyperparameters")
+
+    param_div = p.to_html(fig_params, include_plotlyjs=False, full_html=False)
+    convergence_div = p.to_html(fig_convergence, include_plotlyjs=False, full_html=False)
+
+    combined_html = f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>PINN VDP Dashboard</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            .tab {{
+                overflow: hidden;
+                border: 1px solid #ccc;
+                background-color: #f1f1f1;
+            }}
+            .tab button {{
+                background-color: inherit;
+                float: left;
+                border: none;
+                outline: none;
+                cursor: pointer;
+                padding: 14px 16px;
+                transition: 0.3s;
+                font-size: 17px;
+            }}
+            .tab button:hover {{
+                background-color: #ddd;
+            }}
+            .tab button.active {{
+                background-color: #ccc;
+            }}
+            .tabcontent {{
+                display: none;
+                padding: 6px 12px;
+                border: 1px solid #ccc;
+                border-top: none;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="tab">
+            <button class="tablinks" onclick="openTab(event, 'ParamEffects')" id="defaultOpen">Hyperparameter Effects</button>
+            <button class="tablinks" onclick="openTab(event, 'Convergence')">Loss Convergence</button>
+        </div>
+
+        <div id="ParamEffects" class="tabcontent">
+            {param_div}
+        </div>
+
+        <div id="Convergence" class="tabcontent">
+            {convergence_div}
+        </div>
+
+        <script>
+        function openTab(evt, tabName) {{
+            var i, tabcontent, tablinks;
+            tabcontent = document.getElementsByClassName("tabcontent");
+            for (i = 0; i < tabcontent.length; i++) {{
+                tabcontent[i].style.display = "none";
+            }}
+            tablinks = document.getElementsByClassName("tablinks");
+            for (i = 0; i < tablinks.length; i++) {{
+                tablinks[i].className = tablinks[i].className.replace(" active", "");
+            }}
+            document.getElementById(tabName).style.display = "block";
+            evt.currentTarget.className += " active";
+        }}
+        document.getElementById("defaultOpen").click();
+        </script>
+    </body>
+    </html>
+    '''
+
+    combined_dashboard_path = os.path.join(save_path, 'combined_dashboard.html')
+    with open(combined_dashboard_path, 'w') as f:
+        f.write(combined_html)
+
+    params_dashboard_path = os.path.join(save_path, 'hyperparameter_effects.html')
+    convergence_dashboard_path = os.path.join(save_path, 'convergence_dashboard.html')
+
+    p.write_html(fig_params, params_dashboard_path)
+    p.write_html(fig_convergence, convergence_dashboard_path)
+
+    print(f"Dashboards saved to {save_path}")
+    webbrowser.open('file://' + os.path.abspath(combined_dashboard_path))
+
+def main():
+    parameter_ranges = {
+        'input_dim': [2],
+        'hidden_dim': [i for i in range(1, 101, 20)],
+        'output_dim': [2],
+        'num_layers': [i for i in range(1, 6)],
+        'learning_rate': [i * 1e-3 for i in range(1, 3)],
+        'epochs': [100],
+        'dt': [1e-2]
+    }
+    all_params = generate_parameter_combinations(parameter_ranges)
     print(f"Generated {len(all_params)} parameter combinations")
 
+    save_path = 'Van_Der_Pol_plots'
+    os.makedirs(save_path, exist_ok=True)
+
     results = {}
-
     for params in all_params:
+        print(f'Training parameters: {params}')
         results[str(params)] = []
-
-        input_dim, hidden_dim, output_dim, num_layers, learning_rate, epochs, dt = params.values()
-    
-        model = RK_PINN(input_dim, hidden_dim, output_dim)
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        model = RK_PINN(
+            input_dim=params['input_dim'],
+            hidden_dim=params['hidden_dim'],
+            output_dim=params['output_dim'],
+            num_layers=params['num_layers']
+        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
         criterion = nn.MSELoss()
 
         y0 = torch.tensor([2.0, 0.0], dtype=torch.float32)
         t0 = 0.0
 
-        save_path = 'Van_Der_Pol_plots'
-        os.makedirs(save_path, exist_ok=True)
-
-        losses = train(model, optimizer, criterion, y0, t0, dt, epochs)
+        losses = train(model, optimizer, criterion, y0, t0, params['dt'], params['epochs'])
         results[str(params)].append(losses)
 
-        initial_conditions = [
-            torch.tensor([2.0, 0.0], dtype=torch.float32),
-            # torch.tensor([1.0, 0.0], dtype=torch.float32),
-            # torch.tensor([0.5, 0.0], dtype=torch.float32)
-        ]
-    # After all parameter combinations are evaluated, create a dashboard for visualization
-    print("Creating hyperparameter dashboard...")
+    create_dashboard(results, save_path)
 
-    # Create dashboard to visualize hyperparameter effects
-    fig = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=("Hidden Dimension vs Loss", "Number of Layers vs Loss", 
-                       "Learning Rate vs Loss", "Time Step (dt) vs Loss")
-    )
-
-    # Prepare data for each plot
-    hidden_dim_data = {}
-    num_layers_data = {}  
-    learning_rate_data = {}
-    dt_data = {}
-
-    for param_str, loss_lists in results.items():
-        if loss_lists:  # Check if there are any results for this parameter set
-            final_loss = loss_lists[0][-1]  # Get the last loss from the first training run
-            
-            # Extract parameters from the string representation
-            param_dict = eval(param_str)  # Safe here as we control the string format
-            
-            # Group by hidden_dim
-            hd = param_dict['hidden_dim']
-            if hd not in hidden_dim_data:
-                hidden_dim_data[hd] = []
-            hidden_dim_data[hd].append(final_loss)
-            
-            # Group by num_layers
-            nl = param_dict['num_layers']
-            if nl not in num_layers_data:
-                num_layers_data[nl] = []
-            num_layers_data[nl].append(final_loss)
-            
-            # Group by learning_rate
-            lr = param_dict['learning_rate']
-            if lr not in learning_rate_data:
-                learning_rate_data[lr] = []
-            learning_rate_data[lr].append(final_loss)
-            
-            # Group by dt
-            dt = param_dict['dt']
-            if dt not in dt_data:
-                dt_data[dt] = []
-            dt_data[dt].append(final_loss)
-
-    # Calculate average loss for each parameter value
-    hidden_dim_avg = {k: sum(v)/len(v) for k, v in hidden_dim_data.items()}
-    num_layers_avg = {k: sum(v)/len(v) for k, v in num_layers_data.items()}
-    learning_rate_avg = {k: sum(v)/len(v) for k, v in learning_rate_data.items()}
-    dt_avg = {k: sum(v)/len(v) for k, v in dt_data.items()}
-
-    # Sort the dictionaries by keys for better visualization
-    hidden_dim_avg = {k: hidden_dim_avg[k] for k in sorted(hidden_dim_avg.keys())}
-    num_layers_avg = {k: num_layers_avg[k] for k in sorted(num_layers_avg.keys())}
-    learning_rate_avg = {k: learning_rate_avg[k] for k in sorted(learning_rate_avg.keys())}
-    dt_avg = {k: dt_avg[k] for k in sorted(dt_avg.keys())}
-
-    # Add traces for each plot
-    fig.add_trace(
-        go.Scatter(x=list(hidden_dim_avg.keys()), y=list(hidden_dim_avg.values()),
-                   mode='lines+markers', name='Hidden Dim'),
-        row=1, col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(x=list(num_layers_avg.keys()), y=list(num_layers_avg.values()),
-                   mode='lines+markers', name='Num Layers'),
-        row=1, col=2
-    )
-
-    fig.add_trace(
-        go.Scatter(x=list(learning_rate_avg.keys()), y=list(learning_rate_avg.values()),
-                   mode='lines+markers', name='Learning Rate'),
-        row=2, col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(x=list(dt_avg.keys()), y=list(dt_avg.values()),
-                   mode='lines+markers', name='dt'),
-        row=2, col=2
-    )
-
-    # Update axis titles
-    fig.update_xaxes(title_text="Hidden Dimension", row=1, col=1)
-    fig.update_xaxes(title_text="Number of Layers", row=1, col=2)
-    fig.update_xaxes(title_text="Learning Rate", row=2, col=1)
-    fig.update_xaxes(title_text="Time Step (dt)", row=2, col=2)
-
-    for i in range(1, 3):
-        for j in range(1, 3):
-            fig.update_yaxes(title_text="Loss", row=i, col=j)
-
-    # Update layout
-    fig.update_layout(
-        title="Hyperparameter Effects on Model Loss",
-        height=800,
-        width=1000,
-    )
-
-    # Save the dashboard
-    dashboard_path = os.path.join(save_path, 'hyperparameter_dashboard.html')
-    pio.write_html(fig, dashboard_path)
-    print(f"Dashboard saved to {dashboard_path}")
-
-    # Show the dashboard
-    fig.show()
-
-
+if __name__ == "__main__":
+    main()
