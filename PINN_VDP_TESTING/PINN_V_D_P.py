@@ -1,18 +1,48 @@
 import torch
-import numpy as np
 import torch.nn as nn
-import os
+
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import itertools
-import webbrowser
-import plotly.io as p
-from math import ceil
-from collections import defaultdict
+
+##############################################################################
+# 1) Van der Pol ODE and RK4 Solver
+##############################################################################
+
+def van_der_pol(t, y, mu=1.0):
+    dydt = torch.zeros_like(y)
+    dydt[0] = y[1]
+    dydt[1] = mu * (1 - y[0]**2) * y[1] - y[0]
+    return dydt
+
+def rk4_step(func, t, y, dt, mu=1.0):
+    k1 = func(t, y, mu)
+    k2 = func(t + 0.5*dt, y + 0.5*dt*k1, mu)
+    k3 = func(t + 0.5*dt, y + 0.5*dt*k2, mu)
+    k4 = func(t + dt,     y + dt*k3,    mu)
+    return y + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+def integrate_rk4(func, y0, t0, t_end, N, mu=1.0, device="cpu"):
+    dt = (t_end - t0) / N
+    times = []
+    ys = []
+    t = t0
+    y = y0.clone().to(device)
+    for _ in range(N+1):
+        times.append(t)
+        ys.append(y.unsqueeze(0))
+        y = rk4_step(func, t, y, dt, mu=mu)
+        t += dt
+
+    return (torch.tensor(times, device=device),
+            torch.cat(ys, dim=0))
+
+##############################################################################
+# 2) Neural Network (Predict y_{n+1} from y_n)
+##############################################################################
 
 class RK_PINN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
-        super(RK_PINN, self).__init__()
+        super().__init__()
         self.hidden_layers = nn.ModuleList()
         self.hidden_layers.append(nn.Linear(input_dim, hidden_dim))
         for _ in range(num_layers - 1):
@@ -25,251 +55,518 @@ class RK_PINN(nn.Module):
             x = self.activation(layer(x))
         return self.output_layer(x)
 
-def van_der_pol(t, y, mu=1.0):
-    dydt = torch.zeros_like(y)
-    dydt[0] = y[1]
-    dydt[1] = mu * (1 - y[0]**2) * y[1] - y[0]
-    return dydt
+##############################################################################
+# 3) Generate Training Data & Helpers
+##############################################################################
 
-def implicit_midpoint_step(model, y0, t0, dt):
-    y_mid = y0 + 0.5 * dt * van_der_pol(t0, y0)
-    for _ in range(10):
-        y_mid = y0 + 0.5 * dt * (van_der_pol(t0, y0) + van_der_pol(t0 + 0.5 * dt, y_mid))
-    y_next = y0 + dt * van_der_pol(t0 + 0.5 * dt, y_mid)
-    return y_next
+def generate_training_data(func, y0, t0, t_end, N, mu=1.0, device="cpu"):
+    """
+    Integrate ODE with RK4 from t0 to t_end in N steps,
+    build pairs (y_n, y_{n+1}).
+    """
+    _, all_ys = integrate_rk4(func, y0, t0, t_end, N, mu=mu, device=device)
+    X = all_ys[:-1]
+    Y = all_ys[1:]
+    return X, Y
 
-def train(model, optimizer, criterion, y0, t0, dt, epochs):
-    losses = []
+def integrate_nn(model, y0, t0, t_end, N, device="cpu"):
+    dt = (t_end - t0) / N
+    times = []
+    ys = []
+    t = t0
+    y = y0.clone().to(device).unsqueeze(0)
+    for _ in range(N+1):
+        times.append(t)
+        ys.append(y)
+        y = model(y)
+        t += dt
+    return (torch.tensor(times, device=device),
+            torch.cat(ys, dim=0))
+
+def compute_trajectory_mse(model, y0, t0, t_end, N, mu=1.0, device="cpu"):
+    """
+    Integrate both with RK4 and the NN, returning MSE over the entire trajectory.
+    """
+    _, y_rk4 = integrate_rk4(van_der_pol, y0, t0, t_end, N, mu=mu, device=device)
+    _, y_nn  = integrate_nn(model, y0, t0, t_end, N, device=device)
+    return torch.mean((y_rk4 - y_nn)**2).item()
+
+def compute_final_time_error(model, y0, t0, t_end, N, mu=1.0, device="cpu"):
+    """
+    || y_RK4(t_end) - y_NN(t_end) || (Euclidean distance).
+    """
+    _, y_rk4 = integrate_rk4(van_der_pol, y0, t0, t_end, N, mu=mu, device=device)
+    _, y_nn  = integrate_nn(model, y0, t0, t_end, N, device=device)
+    return torch.norm(y_rk4[-1] - y_nn[-1]).item()
+
+##############################################################################
+# 4) Training Loop: Track Training Loss & Global Errors for Each IC
+##############################################################################
+
+def train_model_multiple_ics(
+    model,
+    X_train, Y_train,
+    ics_for_eval,
+    epochs=1000, lr=1e-3,
+    t0=0.0, t_end=5.0, N_eval=200, mu=1.0,
+    device="cpu"
+):
+    """
+    Train on (X_train, Y_train) to learn y_{n+1} ~ model(y_n).
+    After each epoch, compute trajectory MSE for each IC in ics_for_eval.
+    Returns (training_losses, global_errors),
+      where global_errors[i] is a list of length 'epochs' for i-th IC.
+    """
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    X_train = X_train.to(device)
+    Y_train = Y_train.to(device)
+
+    training_losses = []
+    global_errors = {i: [] for i in range(len(ics_for_eval))}
+
     for epoch in range(epochs):
         optimizer.zero_grad()
-        y_pred = model(y0)
-        y_true = implicit_midpoint_step(model, y0, t0, dt)
-        loss = criterion(y_pred, y_true)
+        Y_pred = model(X_train)
+        loss = criterion(Y_pred, Y_train)
         loss.backward()
         optimizer.step()
-        losses.append(loss.item())
-        if epoch % 10 == 0:
-            print(f'Epoch {epoch}, Loss: {loss.item()}')
-    return losses
 
-def generate_parameter_combinations(parameter_ranges):
-    param_combinations = list(itertools.product(
-        parameter_ranges['input_dim'],
-        parameter_ranges['hidden_dim'],
-        parameter_ranges['output_dim'],
-        parameter_ranges['num_layers'],
-        parameter_ranges['learning_rate'],
-        parameter_ranges['epochs'],
-        parameter_ranges['dt']
-    ))
-    all_params = []
-    for combo in param_combinations:
-        param_dict = {
-            'input_dim': combo[0],
-            'hidden_dim': combo[1],
-            'output_dim': combo[2],
-            'num_layers': combo[3],
-            'learning_rate': combo[4],
-            'epochs': combo[5],
-            'dt': combo[6]
-        }
-        all_params.append(param_dict)
-    return all_params
+        training_losses.append(loss.item())
 
-def create_dashboard(results, save_path):
-    fig_params = make_subplots(rows=2, cols=2, subplot_titles=("HD vs Final Loss", "Layers vs Final Loss",
-                                                               "LR vs Final Loss", "dt vs Final Loss"))
-    hidden_dim_data = defaultdict(list)
-    num_layers_data = defaultdict(list)
-    learning_rate_data = defaultdict(list)
-    dt_data = defaultdict(list)
+        for i, ic in enumerate(ics_for_eval):
+            err = compute_trajectory_mse(
+                model, ic, t0, t_end, N_eval, mu=mu, device=device
+            )
+            global_errors[i].append(err)
 
-    for param_str, loss_lists in results.items():
-        if not loss_lists:
-            continue
-        loss_history = loss_lists[0]
-        final_loss = loss_history[-1]
-        param_dict = eval(param_str)
+        if epoch % 100 == 0:
+            print(f"Epoch {epoch}, Loss={loss.item():.6f}, "
+                  f"GlobErr(IC0)={global_errors[0][-1]:.6f}")
 
-        hd = param_dict['hidden_dim']
-        hidden_dim_data[hd].append(final_loss)
+    return training_losses, global_errors
 
-        nl = param_dict['num_layers']
-        num_layers_data[nl].append(final_loss)
-
-        lr = param_dict['learning_rate']
-        learning_rate_data[lr].append(final_loss)
-
-        d_t = param_dict['dt']
-        dt_data[d_t].append(final_loss)
-
-    def average_dict(data_dict):
-        return {k: sum(v)/len(v) for k, v in data_dict.items()}
-
-    hd_avg = average_dict(hidden_dim_data)
-    nl_avg = average_dict(num_layers_data)
-    lr_avg = average_dict(learning_rate_data)
-    dt_avg = average_dict(dt_data)
-
-    fig_params.add_trace(go.Scatter(x=list(hd_avg.keys()), y=list(hd_avg.values()),
-                                    mode='lines+markers', name='HD'),
-                         row=1, col=1)
-    fig_params.add_trace(go.Scatter(x=list(nl_avg.keys()), y=list(nl_avg.values()),
-                                    mode='lines+markers', name='Layers'),
-                         row=1, col=2)
-    fig_params.add_trace(go.Scatter(x=list(lr_avg.keys()), y=list(lr_avg.values()),
-                                    mode='lines+markers', name='LR'),
-                         row=2, col=1)
-    fig_params.add_trace(go.Scatter(x=list(dt_avg.keys()), y=list(dt_avg.values()),
-                                    mode='lines+markers', name='dt'),
-                         row=2, col=2)
-
-    labels = ["HD","Layers","LR","dt"]
-    idx = 0
-    for i in range(1, 3):
-        for j in range(1, 3):
-            fig_params.update_xaxes(title_text=labels[idx], row=i, col=j)
-            fig_params.update_yaxes(title_text="Final Loss", row=i, col=j)
-            idx += 1
-    fig_params.update_layout(title="Hyperparameter Effects on Final Loss")
-
-    fig_convergence = make_subplots(rows=1, cols=1, subplot_titles=["Loss Convergence"])
-    for param_str, loss_lists in results.items():
-        if not loss_lists:
-            continue
-        param_dict = eval(param_str)
-        label = f"HD={param_dict['hidden_dim']}, NL={param_dict['num_layers']}, LR={param_dict['learning_rate']}, dt={param_dict['dt']}"
-        fig_convergence.add_trace(
-            go.Scatter(x=list(range(len(loss_lists[0]))), y=loss_lists[0], mode='lines', name=label),
-            row=1, col=1
-        )
-    fig_convergence.update_xaxes(title_text="Epochs")
-    fig_convergence.update_yaxes(title_text="Loss")
-    fig_convergence.update_layout(title="Loss Convergence for Different Hyperparameters")
-
-    param_div = p.to_html(fig_params, include_plotlyjs=False, full_html=False)
-    convergence_div = p.to_html(fig_convergence, include_plotlyjs=False, full_html=False)
-
-    combined_html = f'''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>PINN VDP Dashboard</title>
-        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-        <style>
-            .tab {{
-                overflow: hidden;
-                border: 1px solid #ccc;
-                background-color: #f1f1f1;
-            }}
-            .tab button {{
-                background-color: inherit;
-                float: left;
-                border: none;
-                outline: none;
-                cursor: pointer;
-                padding: 14px 16px;
-                transition: 0.3s;
-                font-size: 17px;
-            }}
-            .tab button:hover {{
-                background-color: #ddd;
-            }}
-            .tab button.active {{
-                background-color: #ccc;
-            }}
-            .tabcontent {{
-                display: none;
-                padding: 6px 12px;
-                border: 1px solid #ccc;
-                border-top: none;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="tab">
-            <button class="tablinks" onclick="openTab(event, 'ParamEffects')" id="defaultOpen">Hyperparameter Effects</button>
-            <button class="tablinks" onclick="openTab(event, 'Convergence')">Loss Convergence</button>
-        </div>
-
-        <div id="ParamEffects" class="tabcontent">
-            {param_div}
-        </div>
-
-        <div id="Convergence" class="tabcontent">
-            {convergence_div}
-        </div>
-
-        <script>
-        function openTab(evt, tabName) {{
-            var i, tabcontent, tablinks;
-            tabcontent = document.getElementsByClassName("tabcontent");
-            for (i = 0; i < tabcontent.length; i++) {{
-                tabcontent[i].style.display = "none";
-            }}
-            tablinks = document.getElementsByClassName("tablinks");
-            for (i = 0; i < tablinks.length; i++) {{
-                tablinks[i].className = tablinks[i].className.replace(" active", "");
-            }}
-            document.getElementById(tabName).style.display = "block";
-            evt.currentTarget.className += " active";
-        }}
-        document.getElementById("defaultOpen").click();
-        </script>
-    </body>
-    </html>
-    '''
-
-    combined_dashboard_path = os.path.join(save_path, 'combined_dashboard.html')
-    with open(combined_dashboard_path, 'w') as f:
-        f.write(combined_html)
-
-    params_dashboard_path = os.path.join(save_path, 'hyperparameter_effects.html')
-    convergence_dashboard_path = os.path.join(save_path, 'convergence_dashboard.html')
-
-    p.write_html(fig_params, params_dashboard_path)
-    p.write_html(fig_convergence, convergence_dashboard_path)
-
-    print(f"Dashboards saved to {save_path}")
-    webbrowser.open('file://' + os.path.abspath(combined_dashboard_path))
-
-def main():
-    parameter_ranges = {
-        'input_dim': [2],
-        'hidden_dim': [i for i in range(1, 101, 20)],
-        'output_dim': [2],
-        'num_layers': [i for i in range(1, 6)],
-        'learning_rate': [i * 1e-3 for i in range(1, 3)],
-        'epochs': [100],
-        'dt': [1e-2]
-    }
-    all_params = generate_parameter_combinations(parameter_ranges)
-    print(f"Generated {len(all_params)} parameter combinations")
-
-    save_path = 'Van_Der_Pol_plots'
-    os.makedirs(save_path, exist_ok=True)
-
-    results = {}
-    for params in all_params:
-        print(f'Training parameters: {params}')
-        results[str(params)] = []
-        model = RK_PINN(
-            input_dim=params['input_dim'],
-            hidden_dim=params['hidden_dim'],
-            output_dim=params['output_dim'],
-            num_layers=params['num_layers']
-        )
-        optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
-        criterion = nn.MSELoss()
-
-        y0 = torch.tensor([2.0, 0.0], dtype=torch.float32)
-        t0 = 0.0
-
-        losses = train(model, optimizer, criterion, y0, t0, params['dt'], params['epochs'])
-        results[str(params)].append(losses)
-
-    create_dashboard(results, save_path)
+##############################################################################
+# 5) Main Code + Plots
+##############################################################################
 
 if __name__ == "__main__":
-    main()
+    # -------------------------------------------
+    # 5.1) Choose device (GPU vs. CPU)
+    # -------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # -------------------------------------------
+    # 5.2) Global hyperparameters
+    # -------------------------------------------
+    t0, t_end = 0.0, 5.0
+    mu = 1.0
+    N_data = 100       # steps for reference solution in training set
+    epochs = 300       # training epochs
+    learning_rate = 1e-3
+    N_eval = 200       # steps for measuring trajectory error each epoch
+    N_eval_final = 100 # steps for final trajectory comparisons
+
+    # "Large" range of hidden dims and layer counts
+    hidden_dims = [16, 32, 64]
+    layer_counts = [2, 3, 4]
+
+    # We have multiple initial conditions
+    ics_train = [
+        torch.tensor([2.0, 0.0]),
+        torch.tensor([1.0, -1.0])
+    ]
+    ics_eval = ics_train  # same ICs for final plots & final-time error
+
+    # -------------------------------------------
+    # 5.3) Build a combined training set
+    # -------------------------------------------
+    X_train_list = []
+    Y_train_list = []
+    for ic in ics_train:
+        X_ic, Y_ic = generate_training_data(
+            van_der_pol, ic, t0, t_end, N_data, mu=mu, device=device
+        )
+        X_train_list.append(X_ic)
+        Y_train_list.append(Y_ic)
+    X_train = torch.cat(X_train_list, dim=0)
+    Y_train = torch.cat(Y_train_list, dim=0)
+
+    # -------------------------------------------
+    # Create a list of all (hd, nl) combos
+    # -------------------------------------------
+    configs = []
+    for hd in hidden_dims:
+        for nl in layer_counts:
+            configs.append((hd, nl))
+    num_configs = len(configs)
+
+    # We'll store final-time errors for each config and each IC
+    # final_time_errors[(hd, nl)] = [err_IC0, err_IC1, ...]
+    final_time_errors = {}
+
+    # We'll create one big figure with subplots for the "usual" plots.
+    total_rows = 2 * num_configs
+    total_cols = 4
+
+    fig = make_subplots(
+        rows=total_rows,
+        cols=total_cols,
+        vertical_spacing=0.02,  # must be <= 1/(rows-1) if many rows
+        horizontal_spacing=0.05,
+    )
+
+    # ---------------------------------------------------------------
+    # 5.4) For each (hidden_dim, num_layers), train & produce subplots
+    # ---------------------------------------------------------------
+    for config_idx, (hd, nl) in enumerate(configs):
+        print("\n=============================================")
+        print(f"Training model with hidden_dim={hd}, num_layers={nl}")
+        print("=============================================")
+
+        # 1) Instantiate & Train
+        model = RK_PINN(input_dim=2, hidden_dim=hd, output_dim=2, num_layers=nl).to(device)
+        training_losses, global_errors = train_model_multiple_ics(
+            model,
+            X_train, Y_train,
+            ics_for_eval=ics_eval,
+            epochs=epochs,
+            lr=learning_rate,
+            t0=t0, t_end=t_end, N_eval=N_eval, mu=mu,
+            device=device
+        )
+
+        # 2) Evaluate final trajectories for each IC & store final-time error
+        final_errs_this_config = []
+        results = []
+        for ic in ics_eval:
+            t_rk4, y_rk4 = integrate_rk4(van_der_pol, ic, t0, t_end, N_eval_final, mu=mu, device=device)
+            t_nn,  y_nn  = integrate_nn(model, ic, t0, t_end, N_eval_final, device=device)
+            pointwise_error = torch.norm(y_rk4 - y_nn, dim=1)
+
+            ft_err = torch.norm(y_rk4[-1] - y_nn[-1]).item()
+            final_errs_this_config.append(ft_err)
+
+            results.append((ic, t_rk4, y_rk4, t_nn, y_nn, pointwise_error))
+
+        # Store final-time errors in our dictionary
+        final_time_errors[(hd, nl)] = final_errs_this_config
+
+        # We'll just handle 2 ICs in the subplots below
+        ic0, t_rk4_0, y_rk4_0, t_nn_0, y_nn_0, err_0 = results[0]
+        ic1, t_rk4_1, y_rk4_1, t_nn_1, y_nn_1, err_1 = results[1]
+
+        # Convert to CPU numpy for Plotly
+        def to_np(tensor):
+            return tensor.detach().cpu().numpy()
+
+        t_rk4_0_np = to_np(t_rk4_0)
+        y_rk4_0_np = to_np(y_rk4_0)
+        t_nn_0_np  = to_np(t_nn_0)
+        y_nn_0_np  = to_np(y_nn_0)
+        err_0_np   = to_np(err_0)
+
+        t_rk4_1_np = to_np(t_rk4_1)
+        y_rk4_1_np = to_np(y_rk4_1)
+        t_nn_1_np  = to_np(t_nn_1)
+        y_nn_1_np  = to_np(y_nn_1)
+        err_1_np   = to_np(err_1)
+
+        epochs_axis = list(range(epochs))
+        glob_err_ic0 = global_errors[0]
+        glob_err_ic1 = global_errors[1]
+
+        row_start = 2 * config_idx + 1
+        row2 = row_start + 1
+        config_label = f"HD={hd},NL={nl}"
+
+        # ---------------------------------------------------
+        # a) (row_start, col=1): Training Loss vs. Epoch
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=epochs_axis,
+                y=training_losses,
+                mode='lines',
+                name=f"[{config_label}] TrainLoss"
+            ),
+            row=row_start, col=1
+        )
+        fig.update_xaxes(title_text="Epoch",  row=row_start, col=1)
+        fig.update_yaxes(
+            title_text=f"TrainLoss<br>({config_label})", 
+            row=row_start, col=1
+        )
+
+        # ---------------------------------------------------
+        # b) (row_start, col=2): Global errors vs. epoch, IC0/IC1
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=epochs_axis,
+                y=glob_err_ic0,
+                mode='lines',
+                name=f"[{config_label}] GlobErr(IC0)"
+            ),
+            row=row_start, col=2
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=epochs_axis,
+                y=glob_err_ic1,
+                mode='lines',
+                name=f"[{config_label}] GlobErr(IC1)"
+            ),
+            row=row_start, col=2
+        )
+        fig.update_xaxes(title_text="Epoch", row=row_start, col=2)
+        fig.update_yaxes(
+            title_text=f"Global MSE<br>({config_label})", 
+            row=row_start, col=2
+        )
+
+        # ---------------------------------------------------
+        # c) (row_start, col=3): y0(t), IC0 => RK4 vs. NN
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=t_rk4_0_np,
+                y=y_rk4_0_np[:, 0],
+                mode='lines',
+                name=f"[{config_label}] RK4 y0(IC0)"
+            ),
+            row=row_start, col=3
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=t_nn_0_np,
+                y=y_nn_0_np[:, 0],
+                mode='lines',
+                name=f"[{config_label}] NN y0(IC0)"
+            ),
+            row=row_start, col=3
+        )
+        fig.update_xaxes(title_text="t", row=row_start, col=3)
+        fig.update_yaxes(
+            title_text=f"y0(t),IC0<br>({config_label})", 
+            row=row_start, col=3
+        )
+
+        # ---------------------------------------------------
+        # d) (row_start, col=4): y1(t), IC0 => RK4 vs. NN
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=t_rk4_0_np,
+                y=y_rk4_0_np[:, 1],
+                mode='lines',
+                name=f"[{config_label}] RK4 y1(IC0)"
+            ),
+            row=row_start, col=4
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=t_nn_0_np,
+                y=y_nn_0_np[:, 1],
+                mode='lines',
+                name=f"[{config_label}] NN y1(IC0)"
+            ),
+            row=row_start, col=4
+        )
+        fig.update_xaxes(title_text="t", row=row_start, col=4)
+        fig.update_yaxes(
+            title_text=f"y1(t),IC0<br>({config_label})", 
+            row=row_start, col=4
+        )
+
+        # ---------------------------------------------------
+        # e) (row2, col=1): error(t), IC0
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=t_rk4_0_np,
+                y=err_0_np,
+                mode='lines',
+                name=f"[{config_label}] Error(IC0)"
+            ),
+            row=row2, col=1
+        )
+        fig.update_xaxes(title_text="t", row=row2, col=1)
+        fig.update_yaxes(
+            title_text=f"||RK4 - NN||,IC0<br>({config_label})",
+            row=row2, col=1
+        )
+
+        # ---------------------------------------------------
+        # f) (row2, col=2): y0(t), IC1 => RK4 vs. NN
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=t_rk4_1_np,
+                y=y_rk4_1_np[:, 0],
+                mode='lines',
+                name=f"[{config_label}] RK4 y0(IC1)"
+            ),
+            row=row2, col=2
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=t_nn_1_np,
+                y=y_nn_1_np[:, 0],
+                mode='lines',
+                name=f"[{config_label}] NN y0(IC1)"
+            ),
+            row=row2, col=2
+        )
+        fig.update_xaxes(title_text="t", row=row2, col=2)
+        fig.update_yaxes(
+            title_text=f"y0(t),IC1<br>({config_label})",
+            row=row2, col=2
+        )
+
+        # ---------------------------------------------------
+        # g) (row2, col=3): y1(t), IC1 => RK4 vs. NN
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=t_rk4_1_np,
+                y=y_rk4_1_np[:, 1],
+                mode='lines',
+                name=f"[{config_label}] RK4 y1(IC1)"
+            ),
+            row=row2, col=3
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=t_nn_1_np,
+                y=y_nn_1_np[:, 1],
+                mode='lines',
+                name=f"[{config_label}] NN y1(IC1)"
+            ),
+            row=row2, col=3
+        )
+        fig.update_xaxes(title_text="t", row=row2, col=3)
+        fig.update_yaxes(
+            title_text=f"y1(t),IC1<br>({config_label})",
+            row=row2, col=3
+        )
+
+        # ---------------------------------------------------
+        # h) (row2, col=4): error(t), IC1
+        # ---------------------------------------------------
+        fig.add_trace(
+            go.Scatter(
+                x=t_rk4_1_np,
+                y=err_1_np,
+                mode='lines',
+                name=f"[{config_label}] Error(IC1)"
+            ),
+            row=row2, col=4
+        )
+        fig.update_xaxes(title_text="t", row=row2, col=4)
+        fig.update_yaxes(
+            title_text=f"||RK4 - NN||,IC1<br>({config_label})",
+            row=row2, col=4
+        )
+
+    # -------------------------------------------------------
+    # 5.5) Done with big subplots for each config.
+    #      Show that figure first.
+    # -------------------------------------------------------
+    fig.update_layout(
+        title=("Van der Pol PINN Experiments (All in One Page)<br>"
+               "Varying Hidden Dim & Num Layers, plus Trajectory Plots"),
+        height=3000 + 200 * num_configs,  # enlarge if many configs
+        width=1800,
+        showlegend=True
+    )
+    fig.show()
+
+    # ----------------------------------------------------------------
+    # 5.6) New figure: LINE PLOTS of final-time error vs. network size
+    #
+    # We'll do a 1-row, 2-column layout:
+    #  - Left: final-time error vs. hidden_dim (lines for each num_layers)
+    #  - Right: final-time error vs. num_layers (lines for each hidden_dim)
+    #
+    # Each line is also distinguished by which IC it's for (IC0, IC1, etc.).
+    # ----------------------------------------------------------------
+    unique_hds = sorted({hd for (hd, nl) in configs})
+    unique_nls = sorted({nl for (hd, nl) in configs})
+    num_ics = len(ics_eval)
+
+    fig_line = make_subplots(rows=1, cols=2,
+                             subplot_titles=("Final-Time Error vs. Hidden Dim",
+                                             "Final-Time Error vs. Num Layers"),
+                             horizontal_spacing=0.1)
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~
+    # (1) Final-time error vs. hidden_dim
+    # For each num_layers, and each IC, we plot a line over hidden_dims.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~
+    for nl in unique_nls:
+        # We'll gather (x=hd, y= final_time_errors[(hd,nl)][ic]) for each hd
+        # We want multiple lines: one line per (nl, ic).
+        # Let's do one line per ic. So the name is e.g. "NL=2, IC0"
+        for ic_idx in range(num_ics):
+            x_vals = []
+            y_vals = []
+            for hd in unique_hds:
+                if (hd, nl) in final_time_errors:
+                    ft_errs = final_time_errors[(hd, nl)]
+                    # ft_errs is a list [errIC0, errIC1, ...]
+                    if ic_idx < len(ft_errs):
+                        x_vals.append(hd)
+                        y_vals.append(ft_errs[ic_idx])
+
+            fig_line.add_trace(
+                go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode='lines+markers',
+                    name=f"NL={nl}, IC={ic_idx}",
+                ),
+                row=1, col=1
+            )
+
+    fig_line.update_xaxes(title_text="Hidden Dimension", row=1, col=1)
+    fig_line.update_yaxes(title_text="Final-Time Error", row=1, col=1)
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~
+    # (2) Final-time error vs. num_layers
+    # For each hidden_dim, and each IC, we plot a line over layer_counts.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~
+    for hd in unique_hds:
+        for ic_idx in range(num_ics):
+            x_vals = []
+            y_vals = []
+            for nl in unique_nls:
+                if (hd, nl) in final_time_errors:
+                    ft_errs = final_time_errors[(hd, nl)]
+                    if ic_idx < len(ft_errs):
+                        x_vals.append(nl)
+                        y_vals.append(ft_errs[ic_idx])
+
+            fig_line.add_trace(
+                go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode='lines+markers',
+                    name=f"HD={hd}, IC={ic_idx}",
+                ),
+                row=1, col=2
+            )
+
+    fig_line.update_xaxes(title_text="Number of Layers", row=1, col=2)
+    fig_line.update_yaxes(title_text="Final-Time Error", row=1, col=2)
+
+    fig_line.update_layout(
+        title="Line Plots of Final-Time Error vs. Network Parameters",
+        width=1200,
+        height=600,
+        showlegend=True
+    )
+
+    fig_line.show()

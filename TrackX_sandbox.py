@@ -1,8 +1,8 @@
 # main_script.py
 
 from Classes.magnetic_field import Quadratic_Field, LHCb_Field
-from Classes.particle import Particle, particle_state
-from Classes.Simulators import RK4_sim_dt, RK4_sim_dz
+from Classes.particle import  particle_state
+from Classes.Simulators import RK4_sim_dz
 
 import numpy as np
 import random

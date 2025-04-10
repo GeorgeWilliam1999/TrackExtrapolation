@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ----------------------------
+# Van der Pol System (device-safe)
+# ----------------------------
+def vdp(y, mu=1.0):
+    return torch.stack([
+        y[1],
+        mu * (1 - y[0]**2) * y[1] - y[0]
+    ]).to(y)
+
+# ----------------------------
+# General RK Integrator (Explicit & Implicit)
+# ----------------------------
+def rk_apply(butcher, x, dt, f, max_iter=10, tol=1e-8):
+    A = torch.tensor(butcher['A'], dtype=x.dtype, device=x.device)
+    b = torch.tensor(butcher['b'], dtype=x.dtype, device=x.device)
+
+    s = len(b)
+    d = x.shape[0]
+    k = torch.zeros((s, d), dtype=x.dtype, device=x.device)
+
+    for i in range(s):
+        k_i = k[i].clone()
+
+        def G(ki_guess):
+            weighted_sum = sum(A[i, j] * (ki_guess if j == i else k[j]) for j in range(s))
+            return f(x + dt * weighted_sum)
+
+        for _ in range(max_iter):
+            ki_new = G(k_i)
+            if torch.norm(ki_new - k_i) < tol:
+                break
+            k_i = ki_new
+
+        k[i] = k_i
+
+    x_next = x + dt * torch.sum(b.view(-1, 1) * k, dim=0)
+    return k, x_next
+
+# ----------------------------
+# Training Data Generation
+# ----------------------------
+def generate_training_data(func, y0, t0, t_end, N, butcher, mu=1.0, device="cpu"):
+    """
+    Integrate using rk_apply and collect (x_n, k_n) pairs for NN training.
+    """
+    dt = (t_end - t0) / N
+    x = y0.to(device)
+    d = x.shape[0]
+    s = len(butcher['b'])
+
+    X = torch.zeros((N, d), dtype=torch.float32, device=device)
+    K = torch.zeros((N, s, d), dtype=torch.float32, device=device)
+
+    for n in range(N):
+        X[n] = x
+        k, x_next = rk_apply(butcher, x, dt, lambda y: func(y, mu=mu))
+        K[n] = k
+        x = x_next
+
+    return X, K
+
+# ----------------------------
+# Neural Network RK Stage Predictor
+# ----------------------------
+class NeuralRK(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=64, num_layers=3, dt=0.1, output_dim=2, butcher=None):
+        super().__init__()
+        if butcher is None:
+            butcher = {
+                'A': [
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.5, 0.0, 0.0, 0.0],
+                    [0.0, 0.5, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0]
+                ],
+                'b': [1/6, 1/3, 1/3, 1/6],
+                'c': [0.0, 0.5, 0.5, 1.0]
+            }
+        self.butcher = butcher
+        self.s = len(butcher['b'])
+        self.dt = dt
+        self.output_dim = output_dim
+
+        layers = [nn.Linear(input_dim, hidden_dim), nn.Tanh()]
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.Tanh()]
+        layers += [nn.Linear(hidden_dim, self.s * output_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+        out = self.net(x)
+        return out.view(batch_size, self.s, self.output_dim)
+
+    def loss_fn(self, x, k_true):
+        k_pred = self.forward(x)
+        return F.mse_loss(k_pred, k_true)
+
+# ----------------------------
+# Main Training Loop
+# ----------------------------
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    rk4 = {
+        'A': [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0]
+        ],
+        'b': [1/6, 1/3, 1/3, 1/6],
+        'c': [0.0, 0.5, 0.5, 1.0]
+    }
+
+    # Initial condition (move to device)
+    x0 = torch.tensor([2.0, 0.0], dtype=torch.float32).to(device)
+
+    # Create model and optimizer
+    model = NeuralRK(hidden_dim=64, num_layers=3, dt=0.1, butcher=rk4).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Generate training data
+    X, K = generate_training_data(vdp, x0, t0=0.0, t_end=5, N=1000, butcher=rk4, device=device)
+
+        # Training loop with convergence
+    min_epochs = 100
+    patience = 20
+    delta_tol = 1e-6
+
+    best_loss = float('inf')
+    wait = 0
+    epoch = 0
+    max_epochs = 500000  # safety cap
+
+    while True:
+        idx = torch.randperm(X.size(0))
+        x_batch = X[idx[:64]]
+        k_batch = K[idx[:64]]
+
+        optimizer.zero_grad()
+        loss = model.loss_fn(x_batch, k_batch)
+        loss.backward()
+        optimizer.step()
+
+        loss_val = loss.item()
+
+        if epoch % 100 == 0:
+            print(f"Epoch {epoch:4d}: Loss = {loss_val:.6f}")
+
+        if epoch >= min_epochs:
+            if abs(loss_val - best_loss) < delta_tol:
+                wait += 1
+                if wait >= patience:
+                    print(f"Converged after {epoch} epochs with loss {loss_val:.6f}")
+                    break
+            else:
+                wait = 0
+                best_loss = loss_val
+
+        epoch += 1
+        if epoch >= max_epochs:
+            print("Stopped early: max epochs reached.")
+            break
