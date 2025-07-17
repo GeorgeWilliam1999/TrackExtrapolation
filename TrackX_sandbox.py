@@ -45,16 +45,16 @@ LHCbField = LHCb_Field(data)
 ############## PARTICLES STATES for dz SIM ##############
 
 particle_states = [
-    # particle_state(Ptype='Electron', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.99 * e_mass], charge=e_charge),
-    # particle_state(Ptype='Positron', position=[210, 210, 0], tx=0, ty=0, momentum=[0, 0, 0.99 * e_mass], charge=p_charge),
+    particle_state(Ptype='Electron', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.99 * e_mass], charge=e_charge),
+    particle_state(Ptype='Positron', position=[210, 210, 0], tx=0, ty=0, momentum=[0, 0, 0.99 * e_mass], charge=p_charge),
     particle_state(Ptype='Proton', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.9 * p_mass], charge=p_charge),
-    # particle_state(Ptype='Neutron', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.9 * n_mass], charge=n_charge),
-    # particle_state(Ptype='Pion', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.9 * pi_mass], charge=p_charge),
-    # particle_state(Ptype='Muon', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.99 * mu_mass], charge=e_charge),
+    particle_state(Ptype='Neutron', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.9 * n_mass], charge=n_charge),
+    particle_state(Ptype='Pion', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.9 * pi_mass], charge=p_charge),
+    particle_state(Ptype='Muon', position=[200, 200, 0], tx=0, ty=0, momentum=[0, 0, 0.99 * mu_mass], charge=e_charge),
    ]
 
 random_states = []
-for i in range(100):
+for i in range(10):
     x = random.uniform(-4000, 4000)
     y = random.uniform(-4000, 4000)
     random_states.append(
