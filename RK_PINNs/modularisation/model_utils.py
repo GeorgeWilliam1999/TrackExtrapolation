@@ -11,16 +11,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mpl_toolkits.mplot3d import Axes3D  # for 3D plotting
 
-# ----------------------------
-# Module: NeuralRK Integrator
-# ----------------------------
-# This module provides utilities for generating training data via Runge-Kutta integration,
-# defines a neural network to predict RK stages, and supports rollouts using both classical
-# and learned integrators.
+
+# -----------------------
+# Defaults / constants
+# -----------------------
+DEFAULT_DATA_PATH = os.path.join("RK_PINNs", "Data", "VDP", "VDP_Training.pt")
+DEFAULT_RESULTS_DIR = os.path.join("RK_PINNs", "Results", "VDP", "Models")
+
+DEFAULT_DT = 0.1
+DEFAULT_T_END = 30.0
+DEFAULT_BATCH = 64
+DEFAULT_LR = 1e-3
+DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+RK4_TABLEAU = {
+    "A": [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0, 0.0],
+        [0.0, 0.5, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ],
+    "b": [1 / 6, 1 / 3, 1 / 3, 1 / 6],
+    "c": [0.0, 0.5, 0.5, 1.0],
+}
 
 
 def generate_training_data(
-    func: Callable[..., torch.Tensor],
+    func: Callable[[torch.Tensor, float], torch.Tensor],
     y0: torch.Tensor,
     t0: float,
     t_end: float,
@@ -32,22 +49,21 @@ def generate_training_data(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate training pairs (states X and RK stage outputs K) by integrating a dynamical
-    system from t0 to t_end with step dt using a provided Butcher tableau.
+    system from t0 to t_end with recording step dt using a provided Butcher tableau.
 
     Args:
-        func: Right-hand side function of the ODE. Signature should accept a state tensor
-              and return its time derivative.
+        func: Right-hand side function of the ODE. Signature should be func(y, mu) -> dy/dt.
         y0: Initial state tensor of shape (d,).
-        t0: Initial time.
+        t0: Initial time (unused for autonomous systems but kept for clarity).
         t_end: Final integration time.
         dt: Time step for recording states.
         butcher: Butcher tableau dict with keys 'A', 'b', 'c'.
         mu: System parameter passed to func.
-        M: Number of substeps per dt.
+        M: Number of substeps per dt (useful to produce more accurate steps).
         device: Torch device for computation.
 
     Returns:
-        X: Tensor of recorded states of shape (N, d).
+        X: Tensor of recorded states of shape (N+1, d).
         K: Tensor of RK stages of shape (N, s, d).
     """
     if butcher is None:
@@ -58,22 +74,24 @@ def generate_training_data(
     d = x.numel()
     s = len(butcher['b'])
 
-    X = torch.zeros((N, d), dtype=torch.float32, device=device)
+    X = torch.zeros((N + 1, d), dtype=torch.float32, device=device)
     K = torch.zeros((N, s, d), dtype=torch.float32, device=device)
 
     for n in range(N):
         X[n] = x
-        k, x_next = rk_apply(butcher, x, dt / M, lambda y: func(y, mu=mu))
+        # integrate with M substeps of size dt / M
+        k, x_next = rk_apply(butcher, x, dt / M, lambda y: func(y, mu))
         for _ in range(M - 1):
-            k, x_next = rk_apply(butcher, x_next, dt / M, lambda y: func(y, mu=mu))
+            k, x_next = rk_apply(butcher, x_next, dt / M, lambda y: func(y, mu))
         K[n] = k
         x = x_next
+    X[N] = x  # Final state
 
     return X, K
 
 
 def generate_training_data_all_ics(
-    func: Callable[..., torch.Tensor],
+    func: Callable[[torch.Tensor, float], torch.Tensor],
     y0s: List[torch.Tensor],
     t0: float,
     t_end: float,
@@ -87,21 +105,21 @@ def generate_training_data_all_ics(
     Generate training data for multiple initial conditions by concatenating outputs.
 
     Args:
-        func: ODE right-hand side function.
-        y0s: List of initial state tensors.
+        func: ODE right-hand side function with signature func(y, mu) -> dy/dt.
+        y0s: List of initial state tensors (each of shape (d,)).
         t0: Initial time.
         t_end: Final integration time.
-        dt: Time step for recording.
-        butcher: Butcher tableau.
+        dt: Recording time step.
+        butcher: Butcher tableau dict.
         mu: System parameter.
         M: Number of substeps per dt.
         device: Torch device.
 
     Returns:
-        X_all: Concatenated state tensor of shape (N_total, d).
+        X_all: Concatenated state tensor of shape (N_total+num_ics, d).
         K_all: Concatenated stage tensor of shape (N_total, s, d).
     """
-    data = []
+    data: List[Tuple[torch.Tensor, torch.Tensor]] = []
     for y0 in y0s:
         X, K = generate_training_data(func, y0, t0, t_end, dt, butcher, mu=mu, M=M, device=device)
         data.append((X, K))
@@ -109,6 +127,7 @@ def generate_training_data_all_ics(
     X_all = torch.cat([pair[0] for pair in data], dim=0)
     K_all = torch.cat([pair[1] for pair in data], dim=0)
     return X_all, K_all
+
 
 class NeuralRK(nn.Module):
     """
@@ -201,8 +220,8 @@ class NeuralRK(nn.Module):
         Compute mean-squared error loss between predicted and true RK stages.
 
         Args:
-            x: Input state tensor.
-            k_true: True stage derivatives.
+            x: Input state tensor (batch_size, input_dim).
+            k_true: True stage derivatives (batch_size, s, output_dim).
 
         Returns:
             Scalar loss.
@@ -289,13 +308,19 @@ def rk_apply(
     """
     Single Runge-Kutta integration step for implicit tableau via fixed-point iteration.
 
+    This implementation solves for each stage using a fixed-point iteration:
+        k_i = f(x + dt * sum_j A[i,j] * k_j)
+    where, for stage i, the unknown appears in the weighted sum (implicit).
+    A simple fixed-point iteration is used and repeated up to max_iter iterations
+    or until tol convergence.
+
     Args:
-        butcher: Butcher tableau dict with 'A', 'b'.
-        x: Current state tensor.
-        dt: Time increment.
-        f: Function computing state derivative.
-        max_iter: Max iterations for stage solver.
-        tol: Convergence tolerance.
+        butcher: Butcher tableau dict with 'A' and 'b' (lists or nested lists).
+        x: Current state tensor of shape (d,).
+        dt: Time increment for this step.
+        f: Function computing state derivative with signature f(y) -> dy/dt.
+        max_iter: Maximum iterations for the implicit stage solver.
+        tol: Convergence tolerance for stage iterations.
 
     Returns:
         k: Stage derivatives tensor of shape (s, d).
@@ -328,12 +353,14 @@ def rk_apply(
     x_next = x + dt * torch.sum(b.view(-1, 1) * k, dim=0)
     return k, x_next
 
+
 @torch.no_grad()
 def rollout_neural_model(
     model: NeuralRK,
     x0: torch.Tensor,
     steps: int,
-    dt: float
+    dt: float,
+    scheme: str = "RK4"
 ) -> torch.Tensor:
     """
     Generate trajectory using a trained NeuralRK model.
@@ -341,23 +368,48 @@ def rollout_neural_model(
     Args:
         model: Trained NeuralRK instance.
         x0: Initial state tensor of shape (d,).
-        steps: Number of integration steps.
-        dt: Time step size.
+        steps: Number of integration steps to generate.
+        dt: Time step size used in integration.
+        scheme: Integration scheme; "RK4" expects the model to predict s stages per input.
 
     Returns:
-        Tensor of shape (steps+1, d) containing the trajectory.
+        Tensor of shape (steps+1, d) containing the trajectory (on CPU).
     """
     model.eval()
-    x = x0.unsqueeze(0)
-    trajectory = [x.squeeze(0).cpu()]
 
-    for _ in range(steps):
-        k_pred = model(x)
-        b = torch.tensor(model.butcher['b'], dtype=k_pred.dtype, device=k_pred.device).view(1, -1, 1)
-        x = x + dt * torch.sum(b * k_pred, dim=1)
-        trajectory.append(x.squeeze(0).cpu())
+    if scheme == "RK4":
+        # Expect model to take batch inputs; feed single initial state and iterate.
+        x = x0.unsqueeze(0)  # (1, d)
+        trajectory: List[torch.Tensor] = [x.squeeze(0).cpu()]
 
-    return torch.stack(trajectory)
+        for _ in range(steps):
+            k_pred = model(x)  # (1, s, d)
+            b = torch.tensor(model.butcher['b'], dtype=k_pred.dtype, device=k_pred.device).view(1, -1, 1)
+            x = x + dt * torch.sum(b * k_pred, dim=1)
+            trajectory.append(x.squeeze(0).cpu())
+
+        return torch.stack(trajectory)
+
+    elif scheme == "RK4_traj":
+        # If the model is expected to produce an entire sequence of stages for
+        # multiple successive steps from a single input, the model interface must
+        # support that. Here we assume model(x0.unsqueeze(0)) returns (steps, s, d)
+        x_batched = x0.unsqueeze(0)
+        Ks = model(x_batched)  # assumed shape (steps, s, d) or (1, s, d)
+        # Normalize to (steps, s, d)
+        if Ks.dim() == 3 and Ks.shape[0] == 1:
+            Ks = Ks.repeat(steps, 1, 1)
+        path = torch.zeros((steps + 1, x0.shape[0]), dtype=x0.dtype, device=x0.device)
+        path[0] = x0.cpu()
+        x = x0
+        for i in range(steps):
+            ks = Ks[i]  # (s, d)
+            x = x + dt * torch.sum(ks, dim=0)
+            path[i + 1] = x.cpu()
+        return path
+
+    else:
+        raise ValueError(f"Unknown scheme '{scheme}' for rollout_neural_model.")
 
 
 @torch.no_grad()
@@ -373,18 +425,18 @@ def rollout_rk4(
     Generate trajectory via classical RK integration.
 
     Args:
-        x0: Initial state tensor.
-        steps: Number of steps to simulate.
+        x0: Initial state tensor of shape (d,).
+        steps: Number of recorded steps to simulate.
         dt: Total time step per recorded step.
-        m: Substeps per dt.
-        butcher: Butcher tableau.
-        f: ODE rhs function.
+        m: Substeps per dt (each substep uses dt/m).
+        butcher: Butcher tableau to use for substeps.
+        f: ODE rhs function with signature f(y) -> dy/dt.
 
     Returns:
-        Trajectory tensor of shape (steps+1, d).
+        Trajectory tensor of shape (steps+1, d) (on CPU).
     """
     x = x0.clone()
-    trajectory = [x.cpu()]
+    trajectory: List[torch.Tensor] = [x.cpu()]
     for _ in range(steps):
         k, x_next = rk_apply(butcher, x, dt / m, f)
         for _ in range(m - 1):
@@ -392,3 +444,80 @@ def rollout_rk4(
         x = x_next
         trajectory.append(x.cpu())
     return torch.stack(trajectory)
+
+
+# -----------------------
+# Helpers
+# -----------------------
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def load_training_data(path=DEFAULT_DATA_PATH, device=DEFAULT_DEVICE):
+    X_loaded, K_loaded = torch.load(path)
+    return X_loaded.to(device), K_loaded.to(device)
+
+
+def build_model(hidden_dim=16, num_layers=2, butcher=RK4_TABLEAU, dt=DEFAULT_DT, device=DEFAULT_DEVICE):
+    model = NeuralRK(hidden_dim=hidden_dim, num_layers=num_layers, butcher=butcher, dt=dt).to(device)
+    return model
+
+
+def train_model_single_step(
+    model,
+    X,
+    K,
+    optimizer=None,
+    batch_size=DEFAULT_BATCH,
+    min_epochs=100,
+    patience=20,
+    delta_tol=1e-6,
+    max_epochs=100000,
+    verbose=True,
+):
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=DEFAULT_LR)
+
+    best_loss = float("inf")
+    wait = 0
+    epoch = 0
+
+    while True:
+        idx = torch.randperm(X.size(0), device=X.device)[:batch_size]
+        x_batch = X[idx]
+        k_batch = K[idx]
+
+        optimizer.zero_grad()
+        loss = model.loss_fn(x_batch, k_batch)
+        loss.backward()
+        optimizer.step()
+
+        loss_val = loss.item()
+
+        if epoch == 0:
+            best_loss = loss_val
+
+        if verbose and (epoch % 100 == 0):
+            print(f"Epoch {epoch:6d} | Loss = {loss_val:.6e} | Best = {best_loss:.6e} | Wait = {wait}")
+
+        if epoch >= min_epochs:
+            if abs(loss_val - best_loss) < delta_tol:
+                wait += 1
+                if wait >= patience:
+                    if verbose:
+                        print(f"Converged at epoch {epoch} | loss = {loss_val:.6e}")
+                    break
+            else:
+                best_loss = loss_val
+                wait = 0
+
+        epoch += 1
+        if epoch >= max_epochs:
+            if verbose:
+                print("Stopping early: reached max epochs.")
+            break
+
+    return {"epochs": epoch, "best_loss": best_loss, "final_loss": loss_val}
+
+

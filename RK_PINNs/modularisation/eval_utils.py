@@ -80,6 +80,19 @@ def sample_initial_conditions(n: int) -> torch.Tensor:
     ])
 
 
+def _save_current_figure(name: str) -> None:
+    """
+    Save the current matplotlib figure to the current working directory with a timestamped filename.
+    """
+    fname = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    path = os.path.join(os.getcwd(), fname)
+    try:
+        plt.savefig(path, bbox_inches='tight')
+        print(f"Saved figure to {path}")
+    except Exception as ex:
+        print(f"Failed to save figure {fname}: {ex}")
+
+
 def full_mode_analysis(
     traj_rk: torch.Tensor,
     traj_nn: torch.Tensor,
@@ -161,7 +174,11 @@ def full_mode_analysis(
     ax7.set(title="Cyclical Error (Residuals)", xlabel="Freq [Hz]", ylabel="Residual"); ax7.legend(); ax7.grid()
 
     plt.tight_layout()
+    _save_current_figure("full_mode_analysis")
     plt.show()
+    plt.close()
+
+
 
 
 def plot_mean_and_max_errors_separately(df: pd.DataFrame) -> None:
@@ -195,7 +212,16 @@ def plot_mean_and_max_errors_separately(df: pd.DataFrame) -> None:
     ax2.view_init(elev=30, azim=135); ax2.grid()
 
     plt.tight_layout()
+    # save figure
+    try:
+        fname = f"mean_max_errors_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        path = os.path.join(os.getcwd(), fname)
+        fig.savefig(path, bbox_inches='tight')
+        print(f"Saved figure to {path}")
+    except Exception as ex:
+        print(f"Failed to save figure mean_max_errors: {ex}")
     plt.show()
+    plt.close(fig)
 
 
 def time_rollout(
@@ -311,7 +337,16 @@ def plot_rollout_time(df: pd.DataFrame) -> None:
     fig.colorbar(surf, ax=ax, shrink=0.6, aspect=10, pad=0.1).set_label("Rollout Time (s)")
     ax.set(title="Rollout Time vs Hidden Dim & Layers", xlabel="Hidden Dim", ylabel="Num Layers", zlabel="Time (s)")
     ax.view_init(elev=30, azim=135); ax.grid(True)
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    try:
+        fname = f"rollout_time_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        path = os.path.join(os.getcwd(), fname)
+        fig.savefig(path, bbox_inches='tight')
+        print(f"Saved figure to {path}")
+    except Exception as ex:
+        print(f"Failed to save figure rollout_time: {ex}")
+    plt.show()
+    plt.close(fig)
 
 
 def plot_training_data(X: torch.Tensor, K: torch.Tensor) -> None:
@@ -331,7 +366,10 @@ def plot_training_data(X: torch.Tensor, K: torch.Tensor) -> None:
     )
     plt.title("Training Data: Initial Conditions and RK Stages")
     plt.xlabel("x₁"); plt.ylabel("x₂"); plt.legend(); plt.grid(True)
+    plt.tight_layout()
+    _save_current_figure("training_data")
     plt.show()
+    plt.close()
 
 
 def rk_timmer(
@@ -406,4 +444,13 @@ def plot_accuracy_and_timing_comparison(
     axes[1].barh(combined['method'], combined['mean_error']); axes[1].set(title="Mean Final-Time Error", xlabel="Error"); axes[1].grid(True)
     axes[2].barh(combined['method'], combined['max_error']); axes[2].set(title="Max Final-Time Error", xlabel="Error"); axes[2].grid(True)
     fig.suptitle("NeuralRK vs Classical RK Comparison", fontsize=16)
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    try:
+        fname = f"accuracy_timing_comparison_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        path = os.path.join(os.getcwd(), fname)
+        fig.savefig(path, bbox_inches='tight')
+        print(f"Saved figure to {path}")
+    except Exception as ex:
+        print(f"Failed to save figure accuracy_timing_comparison: {ex}")
+    plt.show()
+    plt.close(fig)
