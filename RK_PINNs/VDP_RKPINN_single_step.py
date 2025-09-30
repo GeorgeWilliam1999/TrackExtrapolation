@@ -132,6 +132,7 @@ def run_single_experiment(
 
     # Optionally filter and plot
     try:
+        evaluate_and_time_saved_models(steps=1,m=10,butcher=RK4_TABLEAU, f=vdp, x0_eval=x0_eval, x0=x0,t_end=dt, dt=0.1, device=device)
         plot_accuracy_and_timing_comparison(df_nn[df_nn['mean_error'] < 0.1], df_rk)
     except Exception:
         # plotting shouldn't break experiments

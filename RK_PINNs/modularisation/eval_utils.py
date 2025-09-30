@@ -278,7 +278,7 @@ def evaluate_and_time_saved_models(
     model_dir = r"C:\Users\GeorgeWilliam\Documents\GitHub\TrackExtrapolation\RK_PINNs\Results\VDP\Models"
 
     for fname in os.listdir(model_dir):
-        if not fname.endswith("RK4.pt"):
+        if (not fname.endswith("RK4.pt")) and (not fname.endswith("RK4_PHYS.pt")):
             continue
         path = os.path.join(model_dir, fname)
         try:

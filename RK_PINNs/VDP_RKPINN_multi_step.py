@@ -15,7 +15,6 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.fft import rfft, rfftfreq
 
 # -----------------------
 # Defaults / constants
@@ -28,7 +27,6 @@ DEFAULT_T_END = 30.0
 DEFAULT_BATCH = 64
 DEFAULT_LR = 1e-3
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 RK4_TABLEAU = {
     "A": [
@@ -42,100 +40,138 @@ RK4_TABLEAU = {
 }
 
 
-X_loaded, K_loaded = torch.load("Data/VDP/VDP_Training.pt")
+def run_multi_experiment(
+    data_path=DEFAULT_DATA_PATH,
+    results_dir=DEFAULT_RESULTS_DIR,
+    hidden_dim=64,
+    num_layers=4,
+    dt=DEFAULT_DT,
+    t_end=DEFAULT_T_END,
+    batch_size=DEFAULT_BATCH,
+    device=DEFAULT_DEVICE,
+    train_if_missing=True,
+):
+    """
+    Multi-step experiment runner that mirrors the single-step script's behaviour
+    but trains/evaluates the model intended to predict trajectories (RK4_traj).
+    """
+    print(f"Using device: {device}")
 
-X, K = X_loaded.to(device), K_loaded.to(device)
+    # Load data using helper (raises a clear error if missing)
+    X, K = load_training_data(data_path, device=device)
 
-K_ = K.reshape(K.shape[0]//(int((t_end - t0) / dt) + 1),int((t_end - t0) / dt) + 1,4,2)
-X_ = X.reshape(X.shape[0]//(int((t_end - t0) / dt) + 1),int((t_end - t0) / dt) + 1,2)
+    # Build model (reuse build_model helper)
+    model = build_model(hidden_dim=hidden_dim, num_layers=num_layers, butcher=RK4_TABLEAU, dt=dt, device=device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=DEFAULT_LR)
+
+    # Ensure results dir
+    ensure_dir(results_dir)
+
+    model_name = model.name_model("VDP", "RK4_traj")
+
+    # Train (using the provided single-step trainer which works with X,K shapes)
+    if train_if_missing and not model.does_model_exist("VDP", "RK4_traj"):
+        print("Starting training (multi-step)...")
+        print(f"Model will be saved as: {model_name}")
+        # train_model_single_step accepts (model, X, K)
+        train_info = train_model_single_step(
+            model,
+            X,
+            K,
+            optimizer=optimizer,
+            batch_size=batch_size,
+            min_epochs=100,
+            patience=20,
+            delta_tol=1e-6,
+            max_epochs=100000,
+            verbose=True,
+        )
+        print(f"Training finished: {train_info}")
+        model.save_model("VDP", "RK4_traj")
+    else:
+        if model.does_model_exist("VDP", "RK4_traj"):
+            print(f"Loading existing model: {model_name}")
+            model.load_state_dict(torch.load(model_name)["model_state_dict"])
+            print("Model loaded successfully.")
+        else:
+            print("Model not found and training disabled. Exiting.")
+            return
+
+    # Example evaluation: rollout neural and classical RK for one initial condition
+    x0 = torch.tensor([2.0, 2.0], dtype=torch.float32).to(device)
+    steps = int(t_end / dt)
+    traj_nn = rollout_neural_model(model, x0, steps, dt, scheme="RK4_traj")
+    traj_rk = rollout_rk4(x0, steps, dt, 10, RK4_TABLEAU, vdp)
+    try:
+        full_mode_analysis(traj_rk, traj_nn, steps, dt)
+    except Exception:
+        pass
+
+    # Persist simple evaluation CSV
+    ensure_dir(results_dir)
+    df_nn = evaluate_and_time_saved_models(steps=steps, m=10, butcher=RK4_TABLEAU, f=vdp, x0_eval=sample_initial_conditions(20).to(device), x0=x0, t_end=dt, dt=dt, device=device)
+    csv_path = os.path.join(results_dir, "last_evaluation_nn_multi.csv")
+    df_nn.to_csv(csv_path, index=False)
+
+    return {"model": model, "df_nn": df_nn}
 
 
+def grid_experiments(
+    hidden_dims=[16, 32],
+    num_layers_list=[2, 4],
+    repeats=1,
+    **single_exp_kwargs
+):
+    device = single_exp_kwargs.get("device", DEFAULT_DEVICE)
+    dt = single_exp_kwargs.get("dt", DEFAULT_DT)
+    results = []
 
-# === Select Device ===
-print(f"Using device: {device}")
+    x0_eval = sample_initial_conditions(20).to(device)
+    x0 = torch.tensor([2.0, 2.0], dtype=torch.float32).to(device)
 
-# === Create Model ===
-output_dim = math.prod(K_.shape[1:])
-print(f"Output dimension: {output_dim}")
-model = NeuralRK(hidden_dim=64, num_layers=4, output_dim=output_dim, butcher=rk4, dt=0.1).to(device)
+    for hidden_dim, num_layers in product(hidden_dims, num_layers_list):
+        for r in range(repeats):
+            print(f"Running config hidden_dim={hidden_dim}, num_layers={num_layers}, repeat={r+1}/{repeats}")
+            model = build_model(hidden_dim=hidden_dim, num_layers=num_layers, butcher=RK4_TABLEAU, dt=dt, device=device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=DEFAULT_LR)
 
-# === Custom Forward & Loss Functions ===
-def forward(x):
-    x = x.view(x.size(0), -1)
-    k = model.net(x)
-    return k
+            # Train if missing
+            if not model.does_model_exist("VDP", "RK4_traj"):
+                train_model_single_step(model, *load_training_data(), optimizer=optimizer, batch_size=single_exp_kwargs.get("batch_size", DEFAULT_BATCH))
+                model.save_model("VDP", "RK4_traj")
 
-def traj_loss(x_, k_):
-    k_pred = model.forward(x_)
+            # Evaluate timing & accuracy
+            df = evaluate_and_time_saved_models(
+                steps=single_exp_kwargs.get("steps", 1), m=single_exp_kwargs.get("m", 10), butcher=RK4_TABLEAU, f=vdp,
+                x0_eval=x0_eval, x0=x0, t_end=dt, dt=dt, device=device
+            )
+            results.append({"hidden_dim": hidden_dim, "num_layers": num_layers, "repeat": r, "df": df})
 
-    return torch.mean((k_pred - k_)** 2)
+    # Optionally collect results into a single DataFrame
+    combined = pd.concat([r["df"] for r in results], ignore_index=True) if results else pd.DataFrame()
+    return combined
 
-model.forward = forward
-model.loss_fn = traj_loss
 
-# === Optimizer ===
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+def main():
+    print("Starting multi-step experiment runner...")
+    ensure_dir(DEFAULT_RESULTS_DIR)
 
-print(f"Model Configuration: {model.num_layers} layers | {model.hidden_dim} hidden dim | dt = {model.dt}")
+    out = run_multi_experiment(
+        data_path=DEFAULT_DATA_PATH,
+        results_dir=DEFAULT_RESULTS_DIR,
+        hidden_dim=64,
+        num_layers=4,
+        dt=DEFAULT_DT,
+        t_end=DEFAULT_T_END,
+        batch_size=DEFAULT_BATCH,
+        device=DEFAULT_DEVICE,
+        train_if_missing=True,
+    )
 
-# === Prepare Data ===
-X_ = X_.to(device)
-K_ = K_.to(device)
-print(f'Shape on device : X_ = {X_.shape}, K_ = {K_.shape}')
+    print("Finished. Key outputs:")
+    if out is not None:
+        print("Saved evaluation CSVs in:", DEFAULT_RESULTS_DIR)
 
-# === Convergence Parameters ===
-min_epochs = 100
-patience = 20
-delta_tol = 1e-9
-max_epochs = 1000000
-batch_size = 64
 
-# === Training or Load Check ===
-if not model.does_model_exist("VDP", "RK4_traj"):
-    print("Starting training...")
-    print(f"Model: NeuralRK_VDP_hd{model.hidden_dim}_layers{model.num_layers}_dt{model.dt}_RK4.pt")
-
-    best_loss = float("inf")
-    wait = 0
-    epoch = 0
-
-    while True:
-        idx = torch.randperm(X_.size(0), device=device)[:batch_size]
-        x_batch = X_[idx,0]
-        k_batch = K_[idx]
-     
-        optimizer.zero_grad()
-        loss = model.loss_fn(x_batch, k_batch.reshape(batch_size, -1))
-        loss.backward()
-        optimizer.step()
-
-        loss_val = loss.item()
-
-        if epoch == 0:
-            best_loss = loss_val
-
-        if epoch % 100 == 0:
-            print(f"Epoch {epoch:5d} | Loss = {loss_val:.6e} | Best = {best_loss:.6e} | Wait = {wait}")
-
-        if epoch >= min_epochs:
-            if abs(loss_val - best_loss) < delta_tol:
-                wait += 1
-                if wait >= patience:
-                    print(f"\nConverged at epoch {epoch} | loss = {loss_val:.6e}")
-                    break
-            else:
-                best_loss = loss_val
-                wait = 0
-
-        epoch += 1
-        if epoch >= max_epochs:
-            print("\nStopping early: reached max epochs.")
-            break
-
-    # Save model
-    model.save_model("VDP", "RK4_traj")
-
-else:
-    print(f"Model already exists: NeuralRK_VDP_hd{model.hidden_dim}_layers{model.num_layers}_dt{model.dt}_RK4.pt")
-    model.load_state_dict(torch.load(model.name_model("VDP", "RK4_traj"))["model_state_dict"])
-    print("Model loaded successfully.")
+if __name__ == "__main__":
+    main()

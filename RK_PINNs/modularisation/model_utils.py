@@ -395,7 +395,8 @@ def rollout_neural_model(
         # multiple successive steps from a single input, the model interface must
         # support that. Here we assume model(x0.unsqueeze(0)) returns (steps, s, d)
         x_batched = x0.unsqueeze(0)
-        Ks = model(x_batched)  # assumed shape (steps, s, d) or (1, s, d)
+        Ks = model(x_batched).reshape(steps + 1, model.s, x0.shape[0])  # assumed shape (steps, s, d) or (1, s, d)
+        print(Ks.shape)
         # Normalize to (steps, s, d)
         if Ks.dim() == 3 and Ks.shape[0] == 1:
             Ks = Ks.repeat(steps, 1, 1)
@@ -404,7 +405,8 @@ def rollout_neural_model(
         x = x0
         for i in range(steps):
             ks = Ks[i]  # (s, d)
-            x = x + dt * torch.sum(ks, dim=0)
+            b = torch.tensor(model.butcher['b'], dtype=x.dtype, device=x.device).view(1, -1, 1)
+            x = x + dt * torch.sum(b * ks, dim=1)
             path[i + 1] = x.cpu()
         return path
 
