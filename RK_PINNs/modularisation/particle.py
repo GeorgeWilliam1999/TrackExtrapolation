@@ -1,31 +1,19 @@
 # particle.py
+"""
+Re-export particle_state class from the canonical Classes module.
 
-import numpy as np
-import json, datetime
+This module provides backward-compatibility imports. For new code,
+import directly from Classes.particle.
+"""
+
+import sys
 import os
 
-class particle_state:
+# Add parent directory to path for Classes import
+_parent = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _parent not in sys.path:
+    sys.path.insert(0, _parent)
 
-    def __init__(self, Ptype, position, tx, ty, momentum, charge):
-        self.Ptype = Ptype
-        self.state = {'x' : position[0], 'y' : position[1], 'z' : position[2], 'tx' : tx, 'ty' : ty, 'q/p' : charge/np.linalg.norm(momentum)}
-        self.state_histores = [self.state.copy()]
-        self.record_state()
+from Classes.particle import particle_state
 
-        print(f'init state : {self.state}')
-    def update_state(self, state):
-        self.state = state
-
-    def record_state(self):
-        self.state_histores.append(self.state.copy())
-
-    def get_state(self):
-        return self.state
-
-    def get_state_histores(self):
-        return self.state_histores
-    
-    def end_run(self,output_dir):
-        filename = os.path.join(output_dir, f"{self.Ptype}.json")
-        with open(filename, "w") as f:
-            json.dump(self.state_histores, f, indent=4)
+__all__ = ["particle_state"]

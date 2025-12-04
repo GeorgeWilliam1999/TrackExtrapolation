@@ -1,0 +1,3 @@
+Method,Parameters,Train Time (s),Epochs,Pos Error (cm),Slope Error,Rollout (ms)
+RK-PINN,"53,528",1882.6,14999,nan,nan,17.48
+Large-RK,"336,920",29.5,14999,nan,nan,18.76

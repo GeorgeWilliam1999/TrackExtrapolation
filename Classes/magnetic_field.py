@@ -1,21 +1,94 @@
 # magnetic_field.py
+"""
+Magnetic Field Implementations for Track Extrapolation.
+
+This module provides magnetic field classes used in particle tracking simulations.
+The main classes are:
+
+- ``MagneticField``: Abstract base class defining the magnetic field interface
+- ``Quadratic_Field``: Simple analytical field for testing purposes
+- ``LHCb_Field``: Real LHCb magnetic field data with trilinear interpolation
+
+Example
+-------
+>>> from Classes.magnetic_field import LHCb_Field
+>>> field = LHCb_Field("path/to/Bfield.rtf")
+>>> B = field.interpolated_field(x=0, y=0, z=500)
+>>> print(B)  # [Bx, By, Bz] in Tesla
+
+Notes
+-----
+The LHCb field data is expected in a text file with columns:
+x, y, z, Bx, By, Bz (space-separated).
+"""
 
 import numpy as np
 from abc import ABC, abstractmethod
 from scipy.interpolate import RegularGridInterpolator
 import matplotlib.pyplot as plt
 
+
 class MagneticField(ABC):
-    def __init__(self, B0 : None):
-        self.B0 = B0  # Base magnetic field strength
+    """
+    Abstract base class for magnetic field implementations.
+
+    This class defines the interface that all magnetic field implementations
+    must follow. Subclasses must implement the ``magnetic_field`` method.
+
+    Parameters
+    ----------
+    B0 : float, optional
+        Base magnetic field strength (used by some subclasses).
+
+    Attributes
+    ----------
+    B0 : float
+        Stored base field strength.
+
+    See Also
+    --------
+    Quadratic_Field : Simple analytical field implementation.
+    LHCb_Field : Real LHCb detector field with interpolation.
+    """
+
+    def __init__(self, B0=None):
+        self.B0 = B0
 
     @abstractmethod
     def magnetic_field(self, x, y, z):
-        """Calculate the magnetic field vector at (x, y, z)."""
+        """
+        Calculate the magnetic field vector at position (x, y, z).
+
+        Parameters
+        ----------
+        x : float
+            X-coordinate in cm.
+        y : float
+            Y-coordinate in cm.
+        z : float
+            Z-coordinate in cm.
+
+        Returns
+        -------
+        numpy.ndarray
+            Magnetic field vector [Bx, By, Bz] in Tesla.
+        """
         pass
 
     def field_strength(self, B):
-        """Calculate the magnitude (absolute value) of the magnetic field vector B."""
+        """
+        Calculate the magnitude of a magnetic field vector.
+
+        Parameters
+        ----------
+        B : array-like
+            Magnetic field vector [Bx, By, Bz].
+
+        Returns
+        -------
+        float
+            Magnitude |B| = sqrt(Bx² + By² + Bz²).
+        """
         return np.linalg.norm(B)
 
     # def interpolated_field(self, x, y, z):
@@ -36,42 +109,145 @@ class QuadraticField(MagneticField):
         return np.array([Bx, By, Bz])
 
 class Quadratic_Field:
+    """
+    Analytical quadratic magnetic field for testing.
+
+    This class provides a simple analytical magnetic field with quadratic
+    dependence on the z-coordinate. Useful for testing track propagation
+    algorithms without loading external data.
+
+    Parameters
+    ----------
+    B0 : float
+        Base magnetic field strength scaling factor.
+
+    Examples
+    --------
+    >>> field = Quadratic_Field(B0=1e-3)
+    >>> B = field.interpolated_field(0, 0, 100)
+    >>> print(B)  # [Bx, By, Bz]
+    """
+
     def __init__(self, B0):
-        self.B0 = B0  # Base magnetic field strength
+        self.B0 = B0
 
     def magnetic_field(self, x, y, z):
-        """Define a parabolic magnetic field Bx(x, y) = B0 * (x^2 - y^2), By(x, y) = B0 * (2xy), Bz = B0 * z"""
-        Bx = self.B0 * -4*z**2 - 4* z  # Parabolic in Z
-        By = self.B0 * -4*z**2 - 4* z  # Parabolic in Z
-        Bz = self.B0 * z               # Linear in z
+        """
+        Calculate quadratic magnetic field at position (x, y, z).
+
+        The field profile is:
+        - Bx = B0 * (-4z² - 4z)
+        - By = B0 * (-4z² - 4z)
+        - Bz = B0 * z
+
+        Parameters
+        ----------
+        x : float
+            X-coordinate (unused in this model).
+        y : float
+            Y-coordinate (unused in this model).
+        z : float
+            Z-coordinate in cm.
+
+        Returns
+        -------
+        numpy.ndarray
+            Field vector [Bx, By, Bz].
+        """
+        Bx = self.B0 * (-4 * z**2 - 4 * z)
+        By = self.B0 * (-4 * z**2 - 4 * z)
+        Bz = self.B0 * z
         return np.array([Bx, By, Bz])
 
     def field_strength(self, B):
-        """Calculate the magnitude (absolute value) of the magnetic field vector B"""
+        """
+        Calculate magnitude of field vector.
+
+        Parameters
+        ----------
+        B : array-like
+            Field vector [Bx, By, Bz].
+
+        Returns
+        -------
+        float
+            Field magnitude |B|.
+        """
         return np.linalg.norm(B)
 
     def interpolated_field(self, x, y, z):
+        """
+        Get field at position (convenience wrapper for magnetic_field).
 
+        Parameters
+        ----------
+        x, y, z : float
+            Position coordinates.
+
+        Returns
+        -------
+        numpy.ndarray
+            Field vector [Bx, By, Bz].
+        """
         return self.magnetic_field(x, y, z)
 
 
 
 class LHCb_Field:
+    """
+    LHCb magnetic field with trilinear interpolation.
+
+    Loads field map data from a text file and provides interpolated
+    magnetic field values at arbitrary positions within the field volume.
+    Uses scipy's RegularGridInterpolator for efficient trilinear interpolation.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the field map file. Expected format is space-separated columns:
+        x, y, z, Bx, By, Bz
+
+    Attributes
+    ----------
+    x_grid, y_grid, z_grid : numpy.ndarray
+        1D arrays of unique grid coordinates.
+    bx, by, bz : numpy.ndarray
+        3D arrays of field components on the grid.
+    interpolator_bx, interpolator_by, interpolator_bz : RegularGridInterpolator
+        Interpolators for each field component.
+
+    Examples
+    --------
+    >>> field = LHCb_Field("Data/Bfield.rtf")
+    >>> B = field.interpolated_field(0, 0, 500)
+    >>> print(f"Field strength: {field.field_strength(B):.4f} T")
+
+    Notes
+    -----
+    Points outside the grid bounds return zero field [0, 0, 0].
+    """
+
     def __init__(self, file_path):
         self.Bfield = self.load_Bfield(file_path)
         self.create_interpolators()
-        # Define the grid points for x, y, z coordinates
-        # self.x = np.arange(self.Bfield.shape[0])
-        # self.y = np.arange(self.Bfield.shape[1])
-        # self.z = np.arange(self.Bfield.shape[2])
 
     def load_Bfield(self, file_path):
-        # Read the data from the file
+        """
+        Load magnetic field data from text file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to field data file.
+
+        Returns
+        -------
+        None
+            Sets instance attributes x_grid, y_grid, z_grid, bx, by, bz.
+        """
         data = np.loadtxt(file_path)
-        # Extract x, y, z, bx, by, bz columns
         x, y, z, bx, by, bz = data.T
-        # Reshape the data into a grid
-        # bx, by, bz = bx / 2000 , by / 2000, bz / 2000
+
         self.x_grid = np.unique(x)
         self.y_grid = np.unique(y)
         self.z_grid = np.unique(z)
@@ -80,50 +256,115 @@ class LHCb_Field:
         self.bz = bz.reshape(len(self.x_grid), len(self.y_grid), len(self.z_grid))
 
     def field_strength(self, B):
-        """Calculate the magnitude (absolute value) of the magnetic field vector B"""
-        return np.linalg.norm(B) * 10000000000000
+        """
+        Calculate field magnitude with scaling factor.
+
+        Parameters
+        ----------
+        B : array-like
+            Field vector [Bx, By, Bz].
+
+        Returns
+        -------
+        float
+            Scaled field magnitude.
+
+        Notes
+        -----
+        The 1e13 scaling factor is for visualization/debugging.
+        For physics calculations, use np.linalg.norm(B) directly.
+        """
+        return np.linalg.norm(B) * 1e13
 
     def create_interpolators(self):
-        # Create interpolators for each component of the B field
-        self.interpolator_bx = RegularGridInterpolator((self.x_grid, self.y_grid, self.z_grid), self.bx)
-        self.interpolator_by = RegularGridInterpolator((self.x_grid, self.y_grid, self.z_grid), self.by)
-        self.interpolator_bz = RegularGridInterpolator((self.x_grid, self.y_grid, self.z_grid), self.bz)
+        """Create scipy RegularGridInterpolators for each field component."""
+        self.interpolator_bx = RegularGridInterpolator(
+            (self.x_grid, self.y_grid, self.z_grid), self.bx
+        )
+        self.interpolator_by = RegularGridInterpolator(
+            (self.x_grid, self.y_grid, self.z_grid), self.by
+        )
+        self.interpolator_bz = RegularGridInterpolator(
+            (self.x_grid, self.y_grid, self.z_grid), self.bz
+        )
 
     def interpolated_field(self, x, y, z):
-        """Interpolate the magnetic field vector at (x, y, z) using RegularGridInterpolator."""
-        # print(f'interpolated filed position {x,y,z}')
+        """
+        Get interpolated magnetic field at position (x, y, z).
+
+        Uses trilinear interpolation between grid points. Returns zero
+        field for points outside the grid bounds.
+
+        Parameters
+        ----------
+        x : float
+            X-coordinate in cm.
+        y : float
+            Y-coordinate in cm.
+        z : float
+            Z-coordinate in cm.
+
+        Returns
+        -------
+        numpy.ndarray
+            Field vector [Bx, By, Bz] of shape (3,).
+        """
         point = np.array([x, y, z])
 
-                # Check if the point is within bounds
+        # Bounds checking
         if (point[0] < self.x_grid[0] or point[0] > self.x_grid[-1] or
             point[1] < self.y_grid[0] or point[1] > self.y_grid[-1] or
             point[2] < self.z_grid[0] or point[2] > self.z_grid[-1]):
             return np.array([0.0, 0.0, 0.0]).reshape(3,)
-
 
         bx = self.interpolator_bx(point)
         by = self.interpolator_by(point)
         bz = self.interpolator_bz(point)
         return np.array([bx, by, bz]).reshape(3,)
-    
+
     def find_gradient(self, x, y, z):
-        """Find the gradient of the magnetic field at (x, y, z) using RegularGridInterpolator."""
+        """
+        Compute field gradient using finite differences.
+
+        Parameters
+        ----------
+        x, y, z : float
+            Position coordinates in cm.
+
+        Returns
+        -------
+        numpy.ndarray
+            Gradient vector [dBx/dx, dBy/dy, dBz/dz] of shape (3,).
+        """
         point = np.array([x, y, z])
-        # Check if the point is within bounds
+
         if (point[0] < self.x_grid[0] or point[0] > self.x_grid[-1] or
             point[1] < self.y_grid[0] or point[1] > self.y_grid[-1] or
             point[2] < self.z_grid[0] or point[2] > self.z_grid[-1]):
             return np.array([0.0, 0.0, 0.0]).reshape(3,)
 
-        # Calculate the gradient using finite differences
         delta = 1e-6
-        bx_dx = (self.interpolator_bx(point + np.array([delta, 0, 0])) - self.interpolator_bx(point - np.array([delta, 0, 0])))/(2*delta)
-        by_dy = (self.interpolator_by(point + np.array([0, delta, 0])) - self.interpolator_by(point - np.array([0, delta, 0])))/(2*delta)
-        bz_dz = (self.interpolator_bz(point + np.array([0, 0, delta])) - self.interpolator_bz(point - np.array([0, 0, delta])))/(2*delta)
+        bx_dx = (self.interpolator_bx(point + np.array([delta, 0, 0])) -
+                 self.interpolator_bx(point - np.array([delta, 0, 0]))) / (2 * delta)
+        by_dy = (self.interpolator_by(point + np.array([0, delta, 0])) -
+                 self.interpolator_by(point - np.array([0, delta, 0]))) / (2 * delta)
+        bz_dz = (self.interpolator_bz(point + np.array([0, 0, delta])) -
+                 self.interpolator_bz(point - np.array([0, 0, delta]))) / (2 * delta)
         return np.array([bx_dx, by_dy, bz_dz]).reshape(3,)
 
     def plot_interpolated_field(self, x, y, z_values):
-        """Plot the interpolated magnetic field for different values of z."""
+        """
+        Plot field components along z-axis at fixed (x, y).
+
+        Parameters
+        ----------
+        x : float
+            Fixed x-coordinate.
+        y : float
+            Fixed y-coordinate.
+        z_values : array-like
+            Array of z-values to plot.
+        """
         Bx, By, Bz = [], [], []
         for z in z_values:
             B = self.interpolated_field(x, y, z)

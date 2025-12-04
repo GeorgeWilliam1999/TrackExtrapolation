@@ -1,0 +1,19 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+tqdm>=4.65.0
+
+# Jupyter support
+jupyter>=1.0.0
+ipykernel>=6.22.0
+
+# Optional: for 3D visualization
+mpl_toolkits
+
+# Development (optional)
+# pytest>=7.3.0
+# black>=23.3.0
+# isort>=5.12.0

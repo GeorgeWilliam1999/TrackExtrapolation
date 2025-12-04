@@ -1,0 +1,4 @@
+Method,Parameters,Train Time (s),Epochs,Final Loss,Mean Error,Max Error,Final Error,Rollout (ms)
+PINN,"8,578",81.7,19999,8.69e-05,1.40e+00,3.53e+00,1.43e+00,0.00
+RK-PINN,"9,032",112.5,19999,8.89e-03,1.82e-01,1.34e+00,1.49e-01,64.23
+Large-RK,"67,464",32.8,19999,6.01e-03,1.34e-01,6.14e-01,1.86e-01,79.37
