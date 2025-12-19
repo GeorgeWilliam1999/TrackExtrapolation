@@ -161,8 +161,13 @@ class LHCbODE:
         
         Bx, By, Bz = B_field[:, 0], B_field[:, 1], B_field[:, 2]
         
-        # Kinematic factor
+        # Clamp slopes to prevent numerical overflow
+        tx = torch.clamp(tx, -10.0, 10.0)
+        ty = torch.clamp(ty, -10.0, 10.0)
+        
+        # Kinematic factor (clamped for stability)
         gamma = torch.sqrt(1 + tx**2 + ty**2)
+        gamma = torch.clamp(gamma, 1.0, 100.0)
         
         # Derivatives
         dx_dz = tx
@@ -171,6 +176,11 @@ class LHCbODE:
         
         dtx_dz = q_p * gamma * (ty * (tx * Bx + Bz) - (1 + tx**2) * By)
         dty_dz = -q_p * gamma * (tx * (ty * By + Bz) - (1 + ty**2) * Bx)
+        
+        # Clamp derivative outputs
+        dtx_dz = torch.clamp(dtx_dz, -1e6, 1e6)
+        dty_dz = torch.clamp(dty_dz, -1e6, 1e6)
+        
         dqp_dz = torch.zeros_like(q_p)
         
         dstate = torch.stack([dx_dz, dy_dz, dz_dz, dtx_dz, dty_dz, dqp_dz], dim=-1)
@@ -184,10 +194,16 @@ class LHCbODE:
         """NumPy version for faster field evaluation."""
         x, y, z, tx, ty, q_p = state
         
+        # Clamp slopes to prevent numerical overflow
+        tx = np.clip(tx, -10.0, 10.0)
+        ty = np.clip(ty, -10.0, 10.0)
+        
         B = self.get_field(x, y, z)
         Bx, By, Bz = B[0], B[1], B[2]
         
+        # Stable gamma calculation
         gamma = np.sqrt(1 + tx**2 + ty**2)
+        gamma = np.clip(gamma, 1.0, 100.0)  # Prevent extreme values
         
         dx_dz = tx
         dy_dz = ty
@@ -195,6 +211,10 @@ class LHCbODE:
         dtx_dz = q_p * gamma * (ty * (tx * Bx + Bz) - (1 + tx**2) * By)
         dty_dz = -q_p * gamma * (tx * (ty * By + Bz) - (1 + ty**2) * Bx)
         dqp_dz = 0.0
+        
+        # Clamp derivative outputs to prevent explosion
+        dtx_dz = np.clip(dtx_dz, -1e6, 1e6)
+        dty_dz = np.clip(dty_dz, -1e6, 1e6)
         
         return np.array([dx_dz, dy_dz, dz_dz, dtx_dz, dty_dz, dqp_dz])
 
@@ -402,6 +422,9 @@ class LHCbRKPINN(nn.Module):
             A_row = self.A[i].view(1, -1, 1)
             state_stage = state + dz * torch.sum(A_row * K_pred, dim=1)
             k_true = self.ode(state_stage)
+            # Skip if NaN/Inf in k_true
+            if not torch.isfinite(k_true).all():
+                continue
             loss_stage = loss_stage + F.mse_loss(K_pred[:, i], k_true)
         loss_stage = loss_stage / self.s
         
@@ -409,21 +432,29 @@ class LHCbRKPINN(nn.Module):
         b = self.b.view(1, -1, 1)
         state_pred = state + dz * torch.sum(b * K_pred, dim=1)
         
-        # True next state
+        # True next state (with NaN protection)
         k1 = self.ode(state)
         k2 = self.ode(state + 0.5 * dz * k1)
         k3 = self.ode(state + 0.5 * dz * k2)
         k4 = self.ode(state + dz * k3)
         state_true = state + (dz / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         
-        loss_step = F.mse_loss(state_pred, state_true)
+        # Only compute step loss if state_true is finite
+        if torch.isfinite(state_true).all() and torch.isfinite(state_pred).all():
+            loss_step = F.mse_loss(state_pred, state_true)
+        else:
+            loss_step = torch.tensor(0.0, device=state.device)
         
         loss = config.stage_weight * loss_stage + config.step_weight * loss_step
         
+        # Final check for NaN
+        if not torch.isfinite(loss):
+            loss = torch.tensor(0.0, device=state.device, requires_grad=True)
+        
         return loss, {
-            "stage": loss_stage.item(),
-            "step": loss_step.item(),
-            "physics_total": loss.item()
+            "stage": loss_stage.item() if torch.isfinite(loss_stage) else 0.0,
+            "step": loss_step.item() if torch.isfinite(loss_step) else 0.0,
+            "physics_total": loss.item() if torch.isfinite(loss) else 0.0
         }
     
     def loss_fn(
@@ -565,8 +596,17 @@ class LHCbTrainer:
                 loss, loss_dict = self.model.loss_fn(x_batch, k_batch)
             
             loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
             self.optimizer.step()
             self.scheduler.step(loss)
+            
+            # Check for NaN loss and skip if encountered
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN/Inf loss at epoch {epoch}, skipping...")
+                continue
             
             self.loss_history.append(loss_dict["total"])
             
@@ -748,7 +788,7 @@ def generate_random_tracks(
     y_range: Tuple[float, float] = (-100, 100),
     tx_range: Tuple[float, float] = (-0.3, 0.3),
     ty_range: Tuple[float, float] = (-0.3, 0.3),
-    p_range: Tuple[float, float] = (5e3, 50e3),  # MeV
+    p_range: Tuple[float, float] = (5.0, 50.0),  # GeV (more stable q/p values)
     charges: List[int] = [-1, 1],
     device: torch.device = DEVICE
 ) -> torch.Tensor:

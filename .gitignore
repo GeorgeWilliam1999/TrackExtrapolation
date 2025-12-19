@@ -1,4 +1,31 @@
+# Large files
 *.json
 *.html
 *.pt
 *.zip
+*.pkl
+*.h5
+*.hdf5
+
+# Results (can be regenerated)
+*.png
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
